@@ -1,0 +1,12 @@
+[package]
+name = "malaise-blaise"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mls-rs = { version = "0.55.2", features = ["x509"] }
+mls-rs-core = "0.27.0"
+mls-rs-crypto-rustcrypto = "0.22.0"
+rustls-pki-types = "1.14.1"
+rustls-webpki = "0.103.13"
+webpki-roots = "1.0.8"
