@@ -1,8 +1,12 @@
-use std::time::Duration;
+use std::{convert::Infallible, time::Duration};
 
-use mls_rs::{ExtensionList, IdentityProvider, error::IntoAnyError, identity::{CredentialType, SigningIdentity}};
+use mls_rs::{
+    ExtensionList, IdentityProvider,
+    error::IntoAnyError,
+    identity::{CredentialType, SigningIdentity},
+};
 use mls_rs_core::identity::MemberValidationContext;
-use rustls_pki_types::{CertificateDer, InvalidDnsNameError, ServerName, UnixTime};
+use rustls_pki_types::{CertificateDer, InvalidDnsNameError, ServerName, TrustAnchor, UnixTime};
 
 #[derive(Debug, Clone)]
 pub enum WebPkiIdentityError {
@@ -11,6 +15,14 @@ pub enum WebPkiIdentityError {
     ChainValidation(String),
     NameValidation(String),
 }
+
+impl std::fmt::Display for WebPkiIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for WebPkiIdentityError {}
 
 impl IntoAnyError for WebPkiIdentityError {
     fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
@@ -41,12 +53,24 @@ impl<'a> TryFrom<&'a str> for PeerValidation<'a> {
 #[derive(Debug, Clone)]
 pub struct WebPkiIdentityProvider<'a> {
     peer_validation: PeerValidation<'a>,
+    trust_anchors: Vec<TrustAnchor<'static>>,
 }
 
 impl<'a> WebPkiIdentityProvider<'a> {
     pub fn new(peer_validation: PeerValidation<'a>) -> Self {
         Self {
-            peer_validation
+            peer_validation,
+            trust_anchors: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        }
+    }
+
+    pub fn with_custom_roots(
+        peer_validation: PeerValidation<'a>,
+        trust_anchors: Vec<TrustAnchor<'static>>,
+    ) -> Self {
+        Self {
+            peer_validation,
+            trust_anchors,
         }
     }
 }
@@ -83,7 +107,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
         ee_cert
             .verify_for_usage(
                 webpki::ALL_VERIFICATION_ALGS,
-                webpki_roots::TLS_SERVER_ROOTS,
+                &self.trust_anchors,
                 &intermediates,
                 time,
                 webpki::KeyUsage::server_auth(),
@@ -138,5 +162,173 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
 
     fn supported_types(&self) -> Vec<CredentialType> {
         vec![CredentialType::X509]
+    }
+}
+
+
+
+pub fn validate_client_credential(
+    signing_identity: &SigningIdentity,
+) -> Result<(), WebPkiIdentityError> {
+    match &signing_identity.credential {
+        mls_rs::identity::Credential::Basic(_) => Ok(()),
+        mls_rs::identity::Credential::X509(_certificate_chain) => unimplemented!(),
+        mls_rs::identity::Credential::Custom(_custom_credential) => unimplemented!(),
+        _ => unimplemented!(),
+    }
+}
+
+pub fn validate_server_credential(
+    signing_identity: &SigningIdentity,
+    trust_anchors: &[TrustAnchor<'_>],
+    expected_name: Option<&ServerName<'_>>,
+) -> Result<(), WebPkiIdentityError> {
+    let chain = signing_identity
+        .credential
+        .as_x509()
+        .ok_or(WebPkiIdentityError::NotX509)?;
+
+    let leaf_der = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
+    let leaf_cert_der = CertificateDer::from(leaf_der.as_ref());
+    let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der)
+        .map_err(|e| WebPkiIdentityError::ChainValidation(e.to_string()))?;
+
+    let intermediates: Vec<CertificateDer> = chain
+        .iter()
+        .skip(1)
+        .map(|c| CertificateDer::from(c.as_ref()))
+        .collect();
+
+    ee_cert
+        .verify_for_usage(
+            webpki::ALL_VERIFICATION_ALGS,
+            trust_anchors,
+            &intermediates,
+            UnixTime::now(),
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .map_err(|err| WebPkiIdentityError::ChainValidation(err.to_string()))?;
+
+    if let Some(server_name) = expected_name {
+        ee_cert
+            .verify_is_valid_for_subject_name(server_name)
+            .map_err(|e| WebPkiIdentityError::NameValidation(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PassThroughIdentityProvider;
+
+impl IdentityProvider for PassThroughIdentityProvider {
+    type Error = Infallible;
+
+    fn validate_member(
+        &self,
+        _signing_identity: &SigningIdentity,
+        _timestamp: Option<mls_rs::time::MlsTime>,
+        _context: MemberValidationContext<'_>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn validate_external_sender(
+        &self,
+        _signing_identity: &SigningIdentity,
+        _timestamp: Option<mls_rs::time::MlsTime>,
+        _extensions: Option<&ExtensionList>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn identity(
+        &self,
+        signing_identity: &SigningIdentity,
+        _extensions: &ExtensionList,
+    ) -> Result<Vec<u8>, Self::Error> {
+        match &signing_identity.credential {
+            mls_rs::identity::Credential::Basic(basic) => Ok(basic.identifier.to_vec()),
+            mls_rs::identity::Credential::X509(chain) if let Some(leaf) = chain.leaf() => {
+                Ok(leaf.to_vec())
+            }
+            _ => Ok(signing_identity.signature_key.as_ref().to_vec()),
+        }
+    }
+
+    fn valid_successor(
+        &self,
+        predecessor: &SigningIdentity,
+        successor: &SigningIdentity,
+        extensions: &ExtensionList,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.identity(predecessor, extensions)? == self.identity(successor, extensions)?)
+    }
+
+    fn supported_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::X509, CredentialType::BASIC]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
+    use mls_rs::identity::x509::{CertificateChain, DerCertificate};
+    use mls_rs_core::identity::MemberValidationContext;
+    use rcgen::KeyPair;
+    use rustls_pki_types::CertificateDer;
+
+    fn generate_ca_and_server_cert() -> (
+        rcgen::CertifiedIssuer<'static, KeyPair>,
+        rcgen::Certificate,
+        KeyPair,
+    ) {
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ca_params = rcgen::CertificateParams::new(vec!["Test CA".into()]).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+        let server_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+
+        (ca, server_cert, server_key)
+    }
+
+    fn ed25519_keypair_from_rcgen(kp: &KeyPair) -> (SignatureSecretKey, SignaturePublicKey) {
+        let pkcs8_der = kp.serialize_der();
+        let seed: [u8; 32] = pkcs8_der[16..48].try_into().unwrap();
+        let signing_key = SigningKey::from_bytes(&seed);
+        (
+            SignatureSecretKey::new(signing_key.to_keypair_bytes().to_vec()),
+            SignaturePublicKey::new(signing_key.verifying_key().to_bytes().to_vec()),
+        )
+    }
+
+    #[test]
+    fn test_validate_member_with_custom_ca() {
+        let (ca, server_cert, server_key) = generate_ca_and_server_cert();
+
+        let (_secret, public) = ed25519_keypair_from_rcgen(&server_key);
+
+        let chain = CertificateChain::from(vec![DerCertificate::new(server_cert.der().to_vec())]);
+        let signing_identity = SigningIdentity::new(chain.into_credential(), public);
+
+        let ca_der = CertificateDer::from(ca.der().to_vec());
+        let trust_anchor = webpki::anchor_from_trusted_cert(&ca_der)
+            .unwrap()
+            .to_owned();
+
+        let provider = WebPkiIdentityProvider::with_custom_roots(
+            PeerValidation::NoSubjectValidation,
+            vec![trust_anchor],
+        );
+
+        provider
+            .validate_member(&signing_identity, None, MemberValidationContext::None)
+            .expect("validation should succeed with custom CA");
     }
 }

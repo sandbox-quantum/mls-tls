@@ -1,30 +1,22 @@
-use std::{
-    collections::BTreeSet,
-    error::Error,
-};
+use std::{error::Error, fs, path::Path};
 
 use mls_rs::{
-    CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, Group, IdentityProvider, MlsMessage, client_builder::MlsConfig, crypto::SignatureSecretKey, error::MlsError, group::ReceivedMessage, identity::{
-        SigningIdentity, basic::{BasicCredential, BasicIdentityProvider},
+    CipherSuite, CipherSuiteProvider, Client, CryptoProvider, Group, IdentityProvider, client_builder::MlsConfig, crypto::{SignaturePublicKey, SignatureSecretKey}, error::MlsError, group::{Node, ReceivedMessage}, identity::{
+        SigningIdentity,
+        basic::BasicCredential,
+        x509::{CertificateChain, DerCertificate},
     }, mls_rules::{CommitOptions, DefaultMlsRules}, storage_provider::in_memory::{
         InMemoryGroupStateStorage, InMemoryKeyPackageStorage, InMemoryPreSharedKeyStorage,
     },
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use rustls_pki_types::CertificateDer;
 
-use crate::web_pki::{PeerValidation, WebPkiIdentityProvider};
+use crate::{mls_two_party_profile_00::{mls_two_party_profile_00_initial_key_agreement_initiator_1, mls_two_party_profile_00_initial_key_agreement_initiator_2, mls_two_party_profile_00_initial_key_agreement_responder_1}, web_pki::PassThroughIdentityProvider};
 
+mod mls_two_party_profile_00;
+mod tree_printer;
 mod web_pki;
-
-#[derive(Debug, Clone)]
-struct ClientHello {
-    key_package: MlsMessage,
-}
-
-#[derive(Debug, Clone)]
-struct ServerHello {
-    welcome: MlsMessage,
-}
 
 struct MlsTlsClient<MConf: MlsConfig, MlsIdentityProvider: IdentityProvider> {
     mls_client: Client<MConf>,
@@ -36,157 +28,101 @@ struct MlsTlsServer<MConf: MlsConfig, MlsIdentityProvider: IdentityProvider> {
     mls_credential_validator: MlsIdentityProvider,
 }
 
-fn mls_two_party_profile_00_initial_key_agreement_initiator_1(
-    initiator: &Client<impl MlsConfig>,
-) -> Result<ClientHello, MlsError> {
-    // The initiator starts the key agreement part of the protocol by
-    // creating a KeyPackage and sending a ClientHello to the responder.
+fn print_tree(group: &Group<impl MlsConfig>) {
+    println!("Group: id={:?} epoch={} cipher_suite={:?}",
+        group.group_id(), group.current_epoch(), group.cipher_suite());
+    println!("My index: {}", group.current_member_index());
+    println!();
 
-    // IMPLEMENTOR_NOTE: check the timestamp. Is it expiration? Is there any requirement on the extensions?
-    let initiator_key_package_msg = initiator.generate_key_package_message(
-        ExtensionList::default(),
-        Default::default(),
-        None,
-    )?;
-    Ok(ClientHello {
-        key_package: initiator_key_package_msg,
-    })
-}
-
-fn mls_two_party_profile_00_initial_key_agreement_responder_1(
-    client_hello: ClientHello,
-    identity_provider: impl IdentityProvider + Clone,
-) -> Result<(ServerHello, Client<impl MlsConfig>, Group<impl MlsConfig>), MlsError> {
-    // > The responder inspects the KeyPackage and checks whether it supports
-    // > the offered ciphersuite and whether the initiator has sufficient
-    // > capabilities to support the connection.
-    let initiator_key_package = client_hello.key_package.as_key_package().unwrap();
-    let initiator_offered_ciphersuite = initiator_key_package.cipher_suite;
-    let server_supported_ciphersuites = CipherSuite::all().collect::<BTreeSet<_>>();
-
-    // IMPLEMENTOR NOTE: MLS 2-party profile doesn't support ciphersuite negotiation.
-
-    if !server_supported_ciphersuites.contains(&initiator_offered_ciphersuite) {
-        panic!("Unsupported ciphersuite: {initiator_offered_ciphersuite:?}");
+    let tree = group.export_tree();
+    for (i, node) in tree.nodes().iter().enumerate() {
+        match node {
+            Some(Node::Leaf(leaf)) => {
+                let cred = &leaf.signing_identity.credential;
+                let cred_type = match cred {
+                    mls_rs::identity::Credential::Basic(b) =>
+                        format!("Basic({:?})", String::from_utf8_lossy(&b.identifier)),
+                    mls_rs::identity::Credential::X509(_) => "X509".to_string(),
+                    mls_rs::identity::Credential::Custom(c) =>
+                        format!("Custom({})", c.credential_type.raw_value()),
+                    _ => format!("Unknown()"),
+                };
+                println!("[{i}] Leaf  | cred={cred_type} pk={:02x?}",
+                    &leaf.signing_identity.signature_key.as_ref()[..8]);
+            }
+            Some(Node::Parent(parent)) => {
+                println!("[{i}] Parent | hpke_pk={:02x?}",
+                    &parent.public_key.as_ref()[..8.min(parent.public_key.as_ref().len())]);
+            }
+            None => {
+                println!("[{i}] (blank)");
+            }
+        }
     }
-
-    // > The responder MUST interface with the AS to ensure that the
-    // > credential in the KeyPackage is valid.
-
-    // TODO check, I think this is done with the identity provider later on.
-
-    // > The responder then locally creates an MLS group and commits to an Add
-    // > proposal containing the initiator's KeyPackage.  The responder sends
-    // > the resulting Welcome message back to the initiator as part of a
-    // > ServerHello message.
-
-    let crypto_provider = RustCryptoProvider::default();
-    let cipher_suite_provider = crypto_provider.cipher_suite_provider(initiator_offered_ciphersuite).unwrap();
-    let (secret, public) = cipher_suite_provider.signature_key_generate().unwrap();
-    // IMPLEMENTOR NOTE: what is the credential for the client where there is no client authentication.
-    // Is client authentication mandatory?
-    //
-    // // TODO: how does that work with x509?
-    let signing_identity = SigningIdentity::new(BasicCredential::new(b"responder".to_vec()).into_credential(), public);
-
-
-    let responder = make_client(
-        crypto_provider,
-        identity_provider,
-        signing_identity,
-        secret,
-        initiator_offered_ciphersuite,
-    )
-    .unwrap();
-
-    let mut responder_group =
-        responder.create_group(ExtensionList::default(), Default::default(), None)?;
-    let responder_commit = responder_group
-        .commit_builder()
-        .add_member(client_hello.key_package.clone())?
-        .build()?;
-
-    let welcome = responder_commit
-        .welcome_messages
-        .into_iter()
-        .next()
-        .unwrap(); // There's something to do here about commit options
-    let server_hello = ServerHello { welcome };
-    // IMPLEMENTOR NOTE: when is the commit actually applied? I assume the server can do it right away, but it would be good to make it explicit.
-    responder_group.apply_pending_commit()?;
-
-    Ok((server_hello, responder, responder_group))
-}
-
-fn mls_two_party_profile_00_initial_key_agreement_initiator_2(
-    initiator: &Client<impl MlsConfig>,
-    server_hello: ServerHello,
-) -> Result<Group<impl MlsConfig>, MlsError> {
-    // > The initiator uses the Welcome to create its local group state.
-    let (initiator_group, _) = initiator.join_group(None, &server_hello.welcome, None)?;
-
-    // > The initiator then inspects the group state and MUST interface with the
-    // > AS to ensure that the credential of the responder is valid.
-
-    // IMPLEMENTOR NOTE: 'inspects the use case' is too vague. What should the initiator inspect exactly?
-    // Only validating the credentials?
-    println!("server hello: {server_hello:?}");
-
-    // IMPLEMENTOR NOTE: what is the identity. Should it be specified? How am I meant to find the identity of the server within the group?
-    // validator.validate(initiator_group.member_at_index(0).unwrap());
-    // This should at least be mentioned in the specs.
-    
-    // TODO: I think this has been verified as part of the identity provider included with the client. To Be Checked
-    
-
-    Ok(initiator_group)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    
+
+    // Load test CA + server certificate from fixtures (cargo run --example generate_fixtures)
+    let fixtures = Path::new("fixtures");
+    let ca_cert_der = fs::read(fixtures.join("ca_cert.der"))?;
+    let server_cert_der = fs::read(fixtures.join("server_cert.der"))?;
+    let server_secret_key = fs::read(fixtures.join("server_secret_key.bin"))?;
+    let server_public_key = fs::read(fixtures.join("server_public_key.bin"))?;
+
+    let ca_der = CertificateDer::from(ca_cert_der.as_slice());
+    let trust_anchors = vec![webpki::anchor_from_trusted_cert(&ca_der)?.to_owned()];
+
     // draft-kohbrok-mls-two-party-profile-00
     // https://datatracker.ietf.org/doc/draft-kohbrok-mls-two-party-profile/00/
     //
     // 3. Initial key agreement
     let crypto_provider = RustCryptoProvider::default();
-    let cipher_suite_provider = crypto_provider.cipher_suite_provider(CipherSuite::CURVE25519_AES128).unwrap();
+    let cipher_suite_provider = crypto_provider
+        .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+        .unwrap();
     let (secret, public) = cipher_suite_provider.signature_key_generate().unwrap();
-    // IMPLEMENTOR NOTE: what is the credential for the client where there is no client authentication.
-    // Is client authentication mandatory?
-    //
-    // // TODO: how does that work with x509?
-    let signing_identity = SigningIdentity::new(BasicCredential::new(b"initiator".to_vec()).into_credential(), public);
+    let signing_identity = SigningIdentity::new(
+        BasicCredential::new(b"initiator".to_vec()).into_credential(),
+        public,
+    );
 
-
-    let mls_tls_cient_mls_client = make_client(
+    let initiator = make_client(
         RustCryptoProvider::default(),
-        WebPkiIdentityProvider::new(PeerValidation::NoSubjectValidation),
         signing_identity,
         secret,
         CipherSuite::CURVE25519_AES128,
     )?;
-    let client_hello =
-        mls_two_party_profile_00_initial_key_agreement_initiator_1(&mls_tls_cient_mls_client)?;
+    let client_hello = mls_two_party_profile_00_initial_key_agreement_initiator_1(&initiator)?;
+
+    let chain = CertificateChain::from(vec![DerCertificate::new(server_cert_der)]);
+    let responder_signing_identity = SigningIdentity::new(
+        chain.into_credential(),
+        SignaturePublicKey::new(server_public_key),
+    );
 
     let (server_hello, _server_mls_client, mut server_group) =
         mls_two_party_profile_00_initial_key_agreement_responder_1(
             client_hello,
-            BasicIdentityProvider::default(),
+            responder_signing_identity,
+            SignatureSecretKey::new(server_secret_key),
+            CipherSuite::CURVE25519_AES128,
         )?;
 
     let mut client_mls_group = mls_two_party_profile_00_initial_key_agreement_initiator_2(
-        &mls_tls_cient_mls_client,
+        &initiator,
+        &trust_anchors,
         server_hello,
     )?;
 
-    let msg = server_group.encrypt_application_message(b"hello, from initiator!", vec![])?;
+    let msg = server_group.encrypt_application_message(b"hello from server!", vec![])?;
     let msg = client_mls_group.process_incoming_message(msg)?;
 
-    println!("Received message {msg:?}");
-
     match msg {
-        ReceivedMessage::ApplicationMessage(application_message_description) => {
-            let msg_str = String::from_utf8_lossy(application_message_description.data());
-            println!("{msg_str}");
+        ReceivedMessage::ApplicationMessage(app_msg) => {
+            let msg_str = String::from_utf8_lossy(app_msg.data());
+            println!("Received: {msg_str}");
         }
         _ => todo!(),
     }
@@ -196,20 +132,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn make_client<C: CryptoProvider + Clone>(
     crypto_provider: C,
-    identity_provider: impl IdentityProvider + Clone,
     signing_identity: SigningIdentity,
     signer: SignatureSecretKey,
     cipher_suite: CipherSuite,
 ) -> Result<Client<impl MlsConfig>, MlsError> {
     let client = Client::builder()
-        .identity_provider(identity_provider)
+        .identity_provider(PassThroughIdentityProvider)
         .crypto_provider(crypto_provider)
         .signing_identity(signing_identity, signer, cipher_suite)
         .mls_rules(DefaultMlsRules::default().with_commit_options(CommitOptions::default()))
         .group_state_storage(InMemoryGroupStateStorage::default())
         .key_package_repo(InMemoryKeyPackageStorage::default())
         .psk_store(InMemoryPreSharedKeyStorage::default())
-        // .extension_types([])                                           TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
+        // .extension_types([])                                           TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES / tree extension not mentioned in the spec?
         // .crypto_provider(crypto_provider)                              TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .custom_proposal_types(types)                                  TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .extension_types(type_)                                        TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
@@ -226,4 +161,120 @@ fn make_client<C: CryptoProvider + Clone>(
         // .signing_identity(signing_identity, signer, cipher_suite)      TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         .build();
     Ok(client)
+}
+
+// IMPLEMENTOR NOTE: do you need to send the entire tree in the server hello? Check ratchet tree extension
+// apparently this might be needed for the key update.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::web_pki::{validate_server_credential};
+    use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
+    use mls_rs::identity::x509::{CertificateChain, DerCertificate};
+    use rcgen::KeyPair;
+    use rustls_pki_types::{CertificateDer, TrustAnchor};
+
+    fn generate_ca_and_server_cert() -> (
+        rcgen::CertifiedIssuer<'static, KeyPair>,
+        rcgen::Certificate,
+        KeyPair,
+    ) {
+        let ca_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ca_params = rcgen::CertificateParams::new(vec!["example.com".into()]).unwrap();
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+        let server_key = KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca).unwrap();
+
+        (ca, server_cert, server_key)
+    }
+
+    fn ed25519_keypair_from_rcgen(kp: &KeyPair) -> (SignatureSecretKey, SignaturePublicKey) {
+        let pkcs8_der = kp.serialize_der();
+        let seed: [u8; 32] = pkcs8_der[16..48].try_into().unwrap();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        (
+            SignatureSecretKey::new(signing_key.to_keypair_bytes().to_vec()),
+            SignaturePublicKey::new(signing_key.verifying_key().to_bytes().to_vec()),
+        )
+    }
+
+    fn custom_trust_anchors(ca: &rcgen::CertifiedIssuer<'_, KeyPair>) -> Vec<TrustAnchor<'static>> {
+        let ca_der = CertificateDer::from(ca.der().to_vec());
+        vec![
+            webpki::anchor_from_trusted_cert(&ca_der)
+                .unwrap()
+                .to_owned(),
+        ]
+    }
+
+    #[test]
+    fn test_two_party_handshake_x509_responder() {
+        let (ca, server_cert, server_key) = generate_ca_and_server_cert();
+        let trust_anchors = custom_trust_anchors(&ca);
+
+        // Responder: X509 credential + PassThroughIdentityProvider
+        let (responder_secret, responder_public) = ed25519_keypair_from_rcgen(&server_key);
+        let chain = CertificateChain::from(vec![DerCertificate::new(server_cert.der().to_vec())]);
+        let responder_signing_identity =
+            SigningIdentity::new(chain.into_credential(), responder_public);
+
+        // Initiator: BasicCredential + PassThroughIdentityProvider
+        let crypto_provider = RustCryptoProvider::default();
+        let cipher_suite_provider = crypto_provider
+            .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+            .unwrap();
+        let (initiator_secret, initiator_public) =
+            cipher_suite_provider.signature_key_generate().unwrap();
+        let initiator_signing_identity = SigningIdentity::new(
+            BasicCredential::new(b"initiator".to_vec()).into_credential(),
+            initiator_public,
+        );
+
+        let initiator = make_client(
+            RustCryptoProvider::default(),
+            initiator_signing_identity,
+            initiator_secret,
+            CipherSuite::CURVE25519_AES128,
+        )
+        .unwrap();
+
+        let client_hello =
+            mls_two_party_profile_00_initial_key_agreement_initiator_1(&initiator).unwrap();
+
+        let (_server_hello, _server_client, mut server_group) =
+            mls_two_party_profile_00_initial_key_agreement_responder_1(
+                client_hello,
+                responder_signing_identity,
+                responder_secret,
+                CipherSuite::CURVE25519_AES128,
+            )
+            .unwrap();
+
+        let mut client_group = mls_two_party_profile_00_initial_key_agreement_initiator_2(
+            &initiator,
+            &trust_anchors,
+            _server_hello,
+        )
+        .unwrap();
+
+        // Inline validation: initiator verifies responder's X509 cert
+        let responder_member = client_group.member_at_index(0).unwrap();
+        validate_server_credential(responder_member.signing_identity(), &trust_anchors, None)
+            .expect("responder cert should validate against custom CA");
+
+        let msg = server_group
+            .encrypt_application_message(b"hello from server", vec![])
+            .unwrap();
+        let received = client_group.process_incoming_message(msg).unwrap();
+
+        match received {
+            ReceivedMessage::ApplicationMessage(app_msg) => {
+                assert_eq!(app_msg.data(), b"hello from server");
+            }
+            _ => panic!("expected application message"),
+        }
+    }
 }
