@@ -16,7 +16,7 @@ pub struct ServerHello {
     welcome: MlsMessage,
 }
 
-pub(crate) fn mls_two_party_profile_00_initial_key_agreement_initiator_1(
+pub(crate) fn initial_key_agreement_initiator_1(
     initiator: &Client<impl MlsConfig>,
 ) -> Result<ClientHello, MlsError> {
     // > The initiator starts the key agreement part of the protocol by
@@ -33,7 +33,7 @@ pub(crate) fn mls_two_party_profile_00_initial_key_agreement_initiator_1(
     })
 }
 
-pub(crate) fn mls_two_party_profile_00_initial_key_agreement_responder_1(
+pub(crate) fn initial_key_agreement_responder_1(
     client_hello: ClientHello,
     signing_identity: SigningIdentity,
     signer: SignatureSecretKey,
@@ -88,7 +88,7 @@ pub(crate) fn mls_two_party_profile_00_initial_key_agreement_responder_1(
     Ok((server_hello, responder, responder_group))
 }
 
-pub(crate) fn mls_two_party_profile_00_initial_key_agreement_initiator_2(
+pub(crate) fn initial_key_agreement_initiator_2(
     initiator: &Client<impl MlsConfig>,
     trust_anchors: &[TrustAnchor<'_>],
     server_hello: ServerHello,

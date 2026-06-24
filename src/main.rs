@@ -12,7 +12,7 @@ use mls_rs::{
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::CertificateDer;
 
-use crate::{mls_two_party_profile_00::{mls_two_party_profile_00_initial_key_agreement_initiator_1, mls_two_party_profile_00_initial_key_agreement_initiator_2, mls_two_party_profile_00_initial_key_agreement_responder_1}, web_pki::PassThroughIdentityProvider};
+use crate::web_pki::PassThroughIdentityProvider;
 
 mod mls_two_party_profile_00;
 mod tree_printer;
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         secret,
         CipherSuite::CURVE25519_AES128,
     )?;
-    let client_hello = mls_two_party_profile_00_initial_key_agreement_initiator_1(&initiator)?;
+    let client_hello = initial_key_agreement_initiator_1(&initiator)?;
 
     let chain = CertificateChain::from(vec![DerCertificate::new(server_cert_der)]);
     let responder_signing_identity = SigningIdentity::new(
@@ -103,14 +103,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let (server_hello, _server_mls_client, mut server_group) =
-        mls_two_party_profile_00_initial_key_agreement_responder_1(
+        initial_key_agreement_responder_1(
             client_hello,
             responder_signing_identity,
             SignatureSecretKey::new(server_secret_key),
             CipherSuite::CURVE25519_AES128,
         )?;
 
-    let mut client_mls_group = mls_two_party_profile_00_initial_key_agreement_initiator_2(
+    let mut client_mls_group = initial_key_agreement_initiator_2(
         &initiator,
         &trust_anchors,
         server_hello,
@@ -242,10 +242,10 @@ mod tests {
         .unwrap();
 
         let client_hello =
-            mls_two_party_profile_00_initial_key_agreement_initiator_1(&initiator).unwrap();
+            mls_two_party_profile_00::initial_key_agreement_initiator_1(&initiator).unwrap();
 
-        let (_server_hello, _server_client, mut server_group) =
-            mls_two_party_profile_00_initial_key_agreement_responder_1(
+        let (server_hello, _server_client, mut server_group) =
+            mls_two_party_profile_00::initial_key_agreement_responder_1(
                 client_hello,
                 responder_signing_identity,
                 responder_secret,
@@ -253,10 +253,10 @@ mod tests {
             )
             .unwrap();
 
-        let mut client_group = mls_two_party_profile_00_initial_key_agreement_initiator_2(
+        let mut client_group = mls_two_party_profile_00::initial_key_agreement_initiator_2(
             &initiator,
             &trust_anchors,
-            _server_hello,
+            server_hello,
         )
         .unwrap();
 
