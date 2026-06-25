@@ -14,7 +14,9 @@ use rustls_pki_types::CertificateDer;
 
 use crate::web_pki::PassThroughIdentityProvider;
 
+mod mls_tls;
 mod mls_two_party_profile_00;
+mod tls_record;
 mod tree_printer;
 mod web_pki;
 
@@ -74,10 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ca_der = CertificateDer::from(ca_cert_der.as_slice());
     let trust_anchors = vec![webpki::anchor_from_trusted_cert(&ca_der)?.to_owned()];
 
-    // draft-kohbrok-mls-two-party-profile-00
-    // https://datatracker.ietf.org/doc/draft-kohbrok-mls-two-party-profile/00/
-    //
-    // 3. Initial key agreement
+    // # Key agreement
     let crypto_provider = RustCryptoProvider::default();
     let cipher_suite_provider = crypto_provider
         .cipher_suite_provider(CipherSuite::CURVE25519_AES128)
@@ -94,7 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         secret,
         CipherSuite::CURVE25519_AES128,
     )?;
-    let client_hello = initial_key_agreement_initiator_1(&initiator)?;
+    let client_hello = mls_two_party_profile_00::initial_key_agreement_initiator_1(&initiator)?;
 
     let chain = CertificateChain::from(vec![DerCertificate::new(server_cert_der)]);
     let responder_signing_identity = SigningIdentity::new(
@@ -103,14 +102,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let (server_hello, _server_mls_client, mut server_group) =
-        initial_key_agreement_responder_1(
+        mls_two_party_profile_00::initial_key_agreement_responder_1(
             client_hello,
             responder_signing_identity,
             SignatureSecretKey::new(server_secret_key),
             CipherSuite::CURVE25519_AES128,
         )?;
 
-    let mut client_mls_group = initial_key_agreement_initiator_2(
+    let mut client_mls_group = mls_two_party_profile_00::initial_key_agreement_initiator_2(
         &initiator,
         &trust_anchors,
         server_hello,

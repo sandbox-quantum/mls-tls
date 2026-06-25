@@ -6,6 +6,23 @@ use rustls_pki_types::TrustAnchor;
 
 use crate::{make_client, print_tree, tree_printer, web_pki::{validate_client_credential, validate_server_credential}};
 
+
+// draft-kohbrok-mls-two-party-profile-00
+// https://datatracker.ietf.org/doc/draft-kohbrok-mls-two-party-profile/00/
+//
+
+
+// 3. Initial key agreement
+
+
+// struct {
+//     MLSMessage key_package;
+// } ClientHello
+
+// struct {
+//     MLSMessage welcome;
+// } ServerHello
+
 #[derive(Debug, Clone)]
 pub struct ClientHello {
     key_package: MlsMessage,
@@ -121,3 +138,84 @@ pub(crate) fn initial_key_agreement_initiator_2(
 
     Ok(initiator_group)
 }
+
+
+// 4.  Continuous key agreement
+
+//    struct {
+//      MLSMessage update
+//    } ConnectionUpdate
+
+//    struct {
+//      uint64 epoch;
+//    } EpochKeyUpdate
+pub struct ConnectionUpdate {
+    update: MlsMessage,
+}
+
+pub struct EpochKeyUpdate {
+    epoch: u64,
+}
+
+
+//    After the initial key agreement phase, both parties can send an MLS
+//    commit with UpdatePath to update their key material.  To ensure that
+//    both agree on the order of such commits and thus on the currently
+//    used key material, they must follow the following rules.
+
+//    *  Each party may send a ConnectionUpdate if they are not currently
+//       waiting for an EpochKeyUpdate to confirm a previous
+//       ConnectionUpdate
+
+//    *  If either party receives a ConnectionUpdate and they're not
+//       currently waiting for an EpochKeyUpdate, they MUST validate and
+//       apply the commit and respond with an EpochKeyUpdate, where epoch
+//       is the group's new epoch
+
+//    *  If the initiator receives a ConnectionUpdate while waiting for an
+//       EpochKeyUpdate, it MUST ignore the ConnectionUpdate and resume
+//       waiting
+
+//    *  If the responder receives a ConnectionUpdate while waiting for an
+//       EpochKeyUpdate, it MUST drop its locally pending commit and
+//       validate and apply the commit as if it hadn't been waiting for an
+//       EpochKeyUpdate
+
+//    *  A party receiving a ConnectionUpdate MUST start using the key
+//       material of the new epoch after sending the EpochKeyUpdate
+
+//    *  A party sending a ConnectionUpdate MUST wait until they receive
+//       the corresponding EpochKeyUpdate before they start using the key
+//       material of the new epoch
+
+// 5.  Resumption
+
+//    Either party may resume a previously interrupted protocol session
+//    based on that session's group state.  The party initiating the
+//    resumption becomes the initiator.
+
+//    struct {
+//      MLSMessage commit;
+//    } ResumptionRequest
+
+//    struct {
+//      MLSMessage commit;
+//    } ResumptionResponse
+
+//    The initiator sends a Resumption message to the responder.  If the
+//    initiator was waiting for an EpochKeyUpdate while the connection was
+//    interrupted, it MUST include the commit from the last
+//    ConnectionUpdate in the Resumption message.  The initiator MUST then
+//    wait for a ResumptionResponse.
+
+//    The responder receiving a ResumptionRequest MUST validate and apply
+//    the commit in the ResumptionRequest and create a commit with
+//    UpdatPath to send back as part of a ResumptionResponse.
+
+//    If one of the parties receives a ResumptionRequest while waiting for
+//    a ResumptionResponse, their reaction depends whether they were the
+//    initial initiator or responder when the connection was first
+//    established.  The initial initiator MUST drop the ResumptionRequest
+//    and continue waiting.  The initial responder MUST drop its pending
+//    commit and instead validate and apply the incoming commit before
+//    responding with a fresh commit as part of a ResumptionResponse.
