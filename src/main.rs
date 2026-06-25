@@ -115,17 +115,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         server_hello,
     )?;
 
-    let msg = server_group.encrypt_application_message(b"hello from server!", vec![])?;
-    let msg = client_mls_group.process_incoming_message(msg)?;
-
-    match msg {
-        ReceivedMessage::ApplicationMessage(app_msg) => {
-            let msg_str = String::from_utf8_lossy(app_msg.data());
-            println!("Received: {msg_str}");
-        }
-        _ => todo!(),
-    }
-
     Ok(())
 }
 

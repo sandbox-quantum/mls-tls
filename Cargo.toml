@@ -10,7 +10,9 @@ mls-rs-crypto-rustcrypto = "0.22.0"
 rustls-pki-types = "1.14.1"
 rustls-webpki = { version = "0.103.13", features = ["ring"] }
 webpki-roots = "1.0.8"
+aes-gcm = "0.10"
 
 [dev-dependencies]
 rcgen = "0.14"
 ed25519-dalek = "2"
+hex = "0.4.3"
