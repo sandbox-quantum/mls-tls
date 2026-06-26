@@ -1,18 +1,25 @@
 use std::{error::Error, fs, path::Path};
 
 use mls_rs::{
-    CipherSuite, CipherSuiteProvider, Client, CryptoProvider, Group, IdentityProvider, client_builder::MlsConfig, crypto::{SignaturePublicKey, SignatureSecretKey}, error::MlsError, group::{Node, ReceivedMessage}, identity::{
+    CipherSuite, CipherSuiteProvider, Client, CryptoProvider, Group, IdentityProvider,
+    client_builder::MlsConfig,
+    crypto::{SignaturePublicKey, SignatureSecretKey},
+    error::MlsError,
+    group::{Node, ReceivedMessage},
+    identity::{
         SigningIdentity,
         basic::BasicCredential,
         x509::{CertificateChain, DerCertificate},
-    }, mls_rules::{CommitOptions, DefaultMlsRules}, storage_provider::in_memory::{
+    },
+    mls_rules::{CommitOptions, DefaultMlsRules},
+    storage_provider::in_memory::{
         InMemoryGroupStateStorage, InMemoryKeyPackageStorage, InMemoryPreSharedKeyStorage,
     },
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::CertificateDer;
 
-use crate::web_pki::PassThroughIdentityProvider;
+use crate::{tls_record::HkdfExpanderSha256, web_pki::PassThroughIdentityProvider};
 
 mod mls_tls;
 mod mls_two_party_profile_00;
@@ -31,8 +38,12 @@ struct MlsTlsServer<MConf: MlsConfig, MlsIdentityProvider: IdentityProvider> {
 }
 
 fn print_tree(group: &Group<impl MlsConfig>) {
-    println!("Group: id={:?} epoch={} cipher_suite={:?}",
-        group.group_id(), group.current_epoch(), group.cipher_suite());
+    println!(
+        "Group: id={:?} epoch={} cipher_suite={:?}",
+        group.group_id(),
+        group.current_epoch(),
+        group.cipher_suite()
+    );
     println!("My index: {}", group.current_member_index());
     println!();
 
@@ -42,19 +53,25 @@ fn print_tree(group: &Group<impl MlsConfig>) {
             Some(Node::Leaf(leaf)) => {
                 let cred = &leaf.signing_identity.credential;
                 let cred_type = match cred {
-                    mls_rs::identity::Credential::Basic(b) =>
-                        format!("Basic({:?})", String::from_utf8_lossy(&b.identifier)),
+                    mls_rs::identity::Credential::Basic(b) => {
+                        format!("Basic({:?})", String::from_utf8_lossy(&b.identifier))
+                    }
                     mls_rs::identity::Credential::X509(_) => "X509".to_string(),
-                    mls_rs::identity::Credential::Custom(c) =>
-                        format!("Custom({})", c.credential_type.raw_value()),
+                    mls_rs::identity::Credential::Custom(c) => {
+                        format!("Custom({})", c.credential_type.raw_value())
+                    }
                     _ => format!("Unknown()"),
                 };
-                println!("[{i}] Leaf  | cred={cred_type} pk={:02x?}",
-                    &leaf.signing_identity.signature_key.as_ref()[..8]);
+                println!(
+                    "[{i}] Leaf  | cred={cred_type} pk={:02x?}",
+                    &leaf.signing_identity.signature_key.as_ref()[..8]
+                );
             }
             Some(Node::Parent(parent)) => {
-                println!("[{i}] Parent | hpke_pk={:02x?}",
-                    &parent.public_key.as_ref()[..8.min(parent.public_key.as_ref().len())]);
+                println!(
+                    "[{i}] Parent | hpke_pk={:02x?}",
+                    &parent.public_key.as_ref()[..8.min(parent.public_key.as_ref().len())]
+                );
             }
             None => {
                 println!("[{i}] (blank)");
@@ -64,8 +81,6 @@ fn print_tree(group: &Group<impl MlsConfig>) {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    
-
     // Load test CA + server certificate from fixtures (cargo run --example generate_fixtures)
     let fixtures = Path::new("fixtures");
     let ca_cert_der = fs::read(fixtures.join("ca_cert.der"))?;
@@ -115,6 +130,58 @@ fn main() -> Result<(), Box<dyn Error>> {
         server_hello,
     )?;
 
+    // client side
+    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
+        &client_mls_group,
+        RustCryptoProvider::new(),
+    )
+    .unwrap();
+    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
+        &client_mls_group,
+        RustCryptoProvider::new(),
+    )
+    .unwrap();
+
+    let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
+    let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());
+
+    let mut client_record_layer = tls_record::RecordLayer::from_traffic_secrets(
+        &client_exp,
+        &server_exp,
+        tls_record::Role::Client,
+    );
+
+    // server side
+    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
+        &client_mls_group,
+        RustCryptoProvider::new(),
+    )
+    .unwrap();
+    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
+        &client_mls_group,
+        RustCryptoProvider::new(),
+    )
+    .unwrap();
+
+    let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
+    let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());
+
+    let mut server_record_layer = tls_record::RecordLayer::from_traffic_secrets(
+        &client_exp,
+        &server_exp,
+        tls_record::Role::Server,
+    );
+
+    let records = client_record_layer
+        .encrypt(
+            tls_record::ContentType::ApplicationData,
+            b"hello from client",
+        )
+        .unwrap();
+
+    let plaintext = server_record_layer.decrypt(&records[0]).unwrap();
+    println!("{}", String::from_utf8_lossy(&plaintext.fragment));
+
     Ok(())
 }
 
@@ -157,7 +224,7 @@ fn make_client<C: CryptoProvider + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web_pki::{validate_server_credential};
+    use crate::web_pki::validate_server_credential;
     use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
     use mls_rs::identity::x509::{CertificateChain, DerCertificate};
     use rcgen::KeyPair;

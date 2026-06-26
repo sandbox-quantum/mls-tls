@@ -2,6 +2,8 @@
 //
 
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::AeadInPlace};
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 // RFC 8446 §5.1:
 //
@@ -85,6 +87,7 @@ pub enum RecordError {
     InvalidContentType(u8),
     EmptyInnerPlaintext,
     SequenceNumberOverflow,
+    HkdfExpandError,
 }
 
 impl std::fmt::Display for RecordError {
@@ -97,6 +100,7 @@ impl std::fmt::Display for RecordError {
             RecordError::InvalidContentType(v) => write!(f, "invalid content type: {v}"),
             RecordError::EmptyInnerPlaintext => write!(f, "decrypted payload is all zeros"),
             RecordError::SequenceNumberOverflow => write!(f, "sequence number would overflow"),
+            RecordError::HkdfExpandError => write!(f, "HKDF expand failed"),
         }
     }
 }
@@ -125,8 +129,90 @@ const LEGACY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
 const SEQ_NUM_LIMIT: u64 = u64::MAX - 1;
 
 // ---------------------------------------------------------------------------
-// Traits (modeled on rustls's MessageEncrypter / MessageDecrypter)
+// HKDF abstraction
 // ---------------------------------------------------------------------------
+
+// RFC 8446 §7.1 — Key Schedule:
+//
+// > "HKDF-Expand-Label(Secret, Label, Context, Length) =
+// >     HKDF-Expand(Secret, HkdfLabel, Length)
+// >
+// > Where HkdfLabel is specified as:
+// >
+// > struct {
+// >     uint16 length = Length;
+// >     opaque label<7..255> = "tls13 " + Label;
+// >     opaque context<0..255> = Context;
+// > } HkdfLabel;"
+
+pub trait HkdfExpander: Send + Sync {
+    fn expand(&self, info: &[u8], output: &mut [u8]) -> Result<(), RecordError>;
+    fn hash_len(&self) -> usize;
+}
+
+pub struct HkdfExpanderSha256 {
+    hkdf: Hkdf<Sha256>,
+}
+
+impl HkdfExpanderSha256 {
+    pub fn from_prk(prk: &[u8]) -> Self {
+        Self {
+            hkdf: Hkdf::<Sha256>::from_prk(prk).expect("PRK must be hash-length (32 bytes)"),
+        }
+    }
+}
+
+impl HkdfExpander for HkdfExpanderSha256 {
+    fn expand(&self, info: &[u8], output: &mut [u8]) -> Result<(), RecordError> {
+        self.hkdf
+            .expand(info, output)
+            .map_err(|_| RecordError::HkdfExpandError)
+    }
+
+    fn hash_len(&self) -> usize {
+        32
+    }
+}
+
+// RFC 8446 §7.1 — HKDF-Expand-Label:
+//
+// > "HKDF-Expand-Label(Secret, Label, Context, Length) =
+// >     HKDF-Expand(Secret, HkdfLabel, Length)"
+//
+// The HkdfLabel info is built from borrowed slices
+// and flattened into a single Vec for the expand call.
+fn hkdf_expand_label<const N: usize>(
+    expander: &dyn HkdfExpander,
+    label: &[u8],
+    context: &[u8],
+) -> [u8; N] {
+    const LABEL_PREFIX: &[u8] = b"tls13 ";
+
+    let output_len = (N as u16).to_be_bytes();
+    let label_len = [(LABEL_PREFIX.len() + label.len()) as u8];
+    let context_len = [context.len() as u8];
+
+    let info: &[&[u8]] = &[
+        &output_len,
+        &label_len,
+        LABEL_PREFIX,
+        label,
+        &context_len,
+        context,
+    ];
+    let info_bytes: Vec<u8> = info.iter().flat_map(|s| s.iter().copied()).collect();
+
+    let mut okm = [0u8; N];
+    expander
+        .expand(&info_bytes, &mut okm)
+        .expect("N is a valid output length");
+    okm
+}
+
+pub enum Role {
+    Client,
+    Server,
+}
 
 pub trait MessageEncrypter: Send + Sync {
     fn encrypt(
@@ -229,10 +315,10 @@ impl MessageEncrypter for Tls13Aes128GcmEncrypter {
         plaintext: &[u8],
         seq: u64,
     ) -> Result<Vec<u8>, RecordError> {
-        // §5.1: "The length MUST NOT exceed 2^14 bytes."
-        if plaintext.len() > MAX_PLAINTEXT_LEN {
-            return Err(RecordError::PayloadTooLarge);
-        }
+        debug_assert!(
+            plaintext.len() <= MAX_PLAINTEXT_LEN,
+            "RecordLayer must pre-chunk plaintext to ≤ 2^14 bytes"
+        );
 
         // §5.2 — Build TLSInnerPlaintext:
         // struct { opaque content[...]; ContentType type; uint8 zeros[...]; }
@@ -374,26 +460,68 @@ impl RecordLayer {
         }
     }
 
+    // RFC 8446 §7.3 — Traffic Key Calculation:
+    //
+    // > "[sender]_write_key = HKDF-Expand-Label(Secret, "key", "", key_length)"
+    // > "[sender]_write_iv  = HKDF-Expand-Label(Secret, "iv", "", iv_length)"
+    pub fn from_traffic_secrets(
+        client_expander: &dyn HkdfExpander,
+        server_expander: &dyn HkdfExpander,
+        role: Role,
+    ) -> Self {
+        let (write_exp, read_exp) = match role {
+            Role::Client => (client_expander, server_expander),
+            Role::Server => (server_expander, client_expander),
+        };
+
+        let write_key: [u8; 16] = hkdf_expand_label(write_exp, b"key", b"");
+        let write_iv: [u8; 12] = hkdf_expand_label(write_exp, b"iv", b"");
+        let read_key: [u8; 16] = hkdf_expand_label(read_exp, b"key", b"");
+        let read_iv: [u8; 12] = hkdf_expand_label(read_exp, b"iv", b"");
+
+        RecordLayer::new(
+            Box::new(Tls13Aes128GcmEncrypter::new(&write_key, write_iv)),
+            Box::new(Tls13Aes128GcmDecrypter::new(&read_key, read_iv)),
+        )
+    }
+
+    // RFC 8446 §5.1:
+    // > "The record layer fragments information blocks into TLSPlaintext records
+    // >  carrying data in chunks of 2^14 bytes or less."
+    //
+    // Returns one wire-format record per chunk. Each chunk gets its own sequence
+    // number and is independently encrypted.
     pub fn encrypt(
         &mut self,
         content_type: ContentType,
         plaintext: &[u8],
-    ) -> Result<Vec<u8>, RecordError> {
-        // §5.3: "If a TLS implementation would need to wrap a sequence number, it MUST
-        //  either rekey (Section 4.6.3) or terminate the connection."
-        if self.write_seq >= SEQ_NUM_LIMIT {
-            return Err(RecordError::SequenceNumberOverflow);
+    ) -> Result<Vec<Vec<u8>>, RecordError> {
+        // §5.1: "Zero-length fragments of Application Data MAY be sent"
+        let chunks: Box<dyn Iterator<Item = &[u8]>> = if plaintext.is_empty() {
+            Box::new(std::iter::once(&[][..]))
+        } else {
+            Box::new(plaintext.chunks(MAX_PLAINTEXT_LEN))
+        };
+
+        let mut records = Vec::new();
+        for chunk in chunks {
+            // §5.3: "If a TLS implementation would need to wrap a sequence number, it MUST
+            //  either rekey (Section 4.6.3) or terminate the connection."
+            if self.write_seq >= SEQ_NUM_LIMIT {
+                return Err(RecordError::SequenceNumberOverflow);
+            }
+
+            let record = self
+                .encrypter
+                .encrypt(content_type, chunk, self.write_seq)?;
+
+            // §5.3: "The appropriate sequence number is incremented by one after reading or
+            //  writing each record."
+            self.write_seq += 1;
+
+            records.push(record);
         }
-
-        let record = self
-            .encrypter
-            .encrypt(content_type, plaintext, self.write_seq)?;
-
-        // §5.3: "The appropriate sequence number is incremented by one after reading or
-        //  writing each record."
-        self.write_seq += 1;
-
-        Ok(record)
+        Ok(records)
     }
 
     pub fn decrypt(&mut self, record: &[u8]) -> Result<TlsPlaintext, RecordError> {
@@ -510,10 +638,11 @@ mod tests {
         );
 
         let plaintext = b"hello from the record layer";
-        let record = layer
+        let records = layer
             .encrypt(ContentType::ApplicationData, plaintext)
             .unwrap();
-        let result = layer.decrypt(&record).unwrap();
+        assert_eq!(records.len(), 1);
+        let result = layer.decrypt(&records[0]).unwrap();
 
         assert_eq!(result.content_type, ContentType::ApplicationData);
         assert_eq!(result.fragment, plaintext);
@@ -530,8 +659,9 @@ mod tests {
         );
 
         let plaintext = b"mls connection update payload";
-        let record = layer.encrypt(ContentType::Handshake, plaintext).unwrap();
-        let result = layer.decrypt(&record).unwrap();
+        let records = layer.encrypt(ContentType::Handshake, plaintext).unwrap();
+        assert_eq!(records.len(), 1);
+        let result = layer.decrypt(&records[0]).unwrap();
 
         assert_eq!(result.content_type, ContentType::Handshake);
         assert_eq!(result.fragment, plaintext);
@@ -547,28 +677,85 @@ mod tests {
             Box::new(Tls13Aes128GcmDecrypter::new(&key, iv)),
         );
 
-        let mut records = Vec::new();
+        let mut all_records = Vec::new();
         for i in 0u8..3 {
             let msg = vec![i; 100];
-            records.push(layer.encrypt(ContentType::ApplicationData, &msg).unwrap());
+            let records = layer.encrypt(ContentType::ApplicationData, &msg).unwrap();
+            assert_eq!(records.len(), 1);
+            all_records.push(records.into_iter().next().unwrap());
         }
 
-        for (i, record) in records.iter().enumerate() {
+        for (i, record) in all_records.iter().enumerate() {
             let result = layer.decrypt(record).unwrap();
             assert_eq!(result.content_type, ContentType::ApplicationData);
             assert_eq!(result.fragment, vec![i as u8; 100]);
         }
     }
 
+    // RFC 8446 §5.1: "fragments information blocks into TLSPlaintext records
+    //  carrying data in chunks of 2^14 bytes or less"
     #[test]
-    fn test_reject_oversized_plaintext() {
-        let key: [u8; 16] = [0; 16];
-        let iv: [u8; 12] = [0; 12];
-        let encrypter = Tls13Aes128GcmEncrypter::new(&key, iv);
+    fn test_fragmentation_large_payload() {
+        let key: [u8; 16] = [0x42; 16];
+        let iv: [u8; 12] = [0x13; 12];
 
-        let big = vec![0u8; MAX_PLAINTEXT_LEN + 1];
-        let result = encrypter.encrypt(ContentType::ApplicationData, &big, 0);
-        assert!(matches!(result, Err(RecordError::PayloadTooLarge)));
+        let mut layer = RecordLayer::new(
+            Box::new(Tls13Aes128GcmEncrypter::new(&key, iv)),
+            Box::new(Tls13Aes128GcmDecrypter::new(&key, iv)),
+        );
+
+        let plaintext: Vec<u8> = (0u8..=255).cycle().take(40960).collect();
+        let records = layer
+            .encrypt(ContentType::ApplicationData, &plaintext)
+            .unwrap();
+
+        assert_eq!(records.len(), 3);
+
+        let mut reassembled = Vec::new();
+        for record in &records {
+            let result = layer.decrypt(record).unwrap();
+            assert_eq!(result.content_type, ContentType::ApplicationData);
+            reassembled.extend_from_slice(&result.fragment);
+        }
+        assert_eq!(reassembled, plaintext);
+    }
+
+    // RFC 8446 §5.1: "Zero-length fragments of Application Data MAY be sent"
+    #[test]
+    fn test_empty_payload() {
+        let key: [u8; 16] = [0x42; 16];
+        let iv: [u8; 12] = [0x13; 12];
+
+        let mut layer = RecordLayer::new(
+            Box::new(Tls13Aes128GcmEncrypter::new(&key, iv)),
+            Box::new(Tls13Aes128GcmDecrypter::new(&key, iv)),
+        );
+
+        let records = layer
+            .encrypt(ContentType::ApplicationData, b"")
+            .unwrap();
+        assert_eq!(records.len(), 1);
+
+        let result = layer.decrypt(&records[0]).unwrap();
+        assert_eq!(result.content_type, ContentType::ApplicationData);
+        assert!(result.fragment.is_empty());
+    }
+
+    #[test]
+    fn test_exact_max_plaintext_no_split() {
+        let key: [u8; 16] = [0x42; 16];
+        let iv: [u8; 12] = [0x13; 12];
+
+        let mut layer = RecordLayer::new(
+            Box::new(Tls13Aes128GcmEncrypter::new(&key, iv)),
+            Box::new(Tls13Aes128GcmDecrypter::new(&key, iv)),
+        );
+
+        let plaintext = vec![0xAB; MAX_PLAINTEXT_LEN];
+        let records = layer
+            .encrypt(ContentType::ApplicationData, &plaintext)
+            .unwrap();
+        assert_eq!(records.len(), 1);
     }
 
     #[test]
@@ -632,5 +819,83 @@ mod tests {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0b, 0x0b,
         ];
         assert_eq!(make_nonce(&iv, 256), expected);
+    }
+
+    // RFC 8448 §3 — verify HKDF-Expand-Label derives the correct key and iv
+    // from the server application traffic secret
+    #[test]
+    fn test_rfc8448_hkdf_expand_label_server_key() {
+        let server_traffic_secret = hex(
+            "a1 1a f9 f0 55 31 f8 56 ad 47 11 6b 45 a9 50 32
+             82 04 b4 f4 4b fb 6b 3a 4b 4f 1f 3f cb 63 16 43",
+        );
+        let expected_key = hex("9f 02 28 3b 6c 9c 07 ef c2 6b b9 f2 ac 92 e3 56");
+        let expected_iv = hex("cf 78 2b 88 dd 83 54 9a ad f1 e9 84");
+
+        let expander = HkdfExpanderSha256::from_prk(&server_traffic_secret);
+        let key: [u8; 16] = hkdf_expand_label(&expander, b"key", b"");
+        let iv: [u8; 12] = hkdf_expand_label(&expander, b"iv", b"");
+
+        assert_eq!(key.as_slice(), &expected_key);
+        assert_eq!(iv.as_slice(), &expected_iv);
+    }
+
+    // RFC 8448 §3 — verify HKDF-Expand-Label derives the correct key and iv
+    // from the client application traffic secret
+    #[test]
+    fn test_rfc8448_hkdf_expand_label_client_key() {
+        let client_traffic_secret = hex(
+            "9e 40 64 6c e7 9a 7f 9d c0 5a f8 88 9b ce 65 52
+             87 5a fa 0b 06 df 00 87 f7 92 eb b7 c1 75 04 a5",
+        );
+        let expected_key = hex("17 42 2d da 59 6e d5 d9 ac d8 90 e3 c6 3f 50 51");
+        let expected_iv = hex("5b 78 92 3d ee 08 57 90 33 e5 23 d9");
+
+        let expander = HkdfExpanderSha256::from_prk(&client_traffic_secret);
+        let key: [u8; 16] = hkdf_expand_label(&expander, b"key", b"");
+        let iv: [u8; 12] = hkdf_expand_label(&expander, b"iv", b"");
+
+        assert_eq!(key.as_slice(), &expected_key);
+        assert_eq!(iv.as_slice(), &expected_iv);
+    }
+
+    // Round-trip test: build RecordLayer from traffic secrets, encrypt as
+    // client, decrypt as server
+    #[test]
+    fn test_from_traffic_secrets_round_trip() {
+    let client_secret = [0xAA; 32];
+        let server_secret = [0xBB; 32];
+
+        let client_exp = HkdfExpanderSha256::from_prk(&client_secret);
+        let server_exp = HkdfExpanderSha256::from_prk(&server_secret);
+
+        let mut client_layer =
+            RecordLayer::from_traffic_secrets(&client_exp, &server_exp, Role::Client);
+
+        let client_exp = HkdfExpanderSha256::from_prk(&client_secret);
+        let server_exp = HkdfExpanderSha256::from_prk(&server_secret);
+
+        let mut server_layer =
+            RecordLayer::from_traffic_secrets(&client_exp, &server_exp, Role::Server);
+
+        let plaintext = b"hello from client to server";
+        let records = client_layer
+            .encrypt(ContentType::ApplicationData, plaintext)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let result = server_layer.decrypt(&records[0]).unwrap();
+
+        assert_eq!(result.content_type, ContentType::ApplicationData);
+        assert_eq!(result.fragment, plaintext);
+
+        let reply = b"hello from server to client";
+        let records = server_layer
+            .encrypt(ContentType::ApplicationData, reply)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let result = client_layer.decrypt(&records[0]).unwrap();
+
+        assert_eq!(result.content_type, ContentType::ApplicationData);
+        assert_eq!(result.fragment, reply);
     }
 }
