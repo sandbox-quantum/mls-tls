@@ -124,52 +124,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             CipherSuite::CURVE25519_AES128,
         )?;
 
-    let mut client_mls_group = mls_two_party_profile_00::initial_key_agreement_initiator_2(
+    let mut client_group = mls_two_party_profile_00::initial_key_agreement_initiator_2(
         &initiator,
         &trust_anchors,
         server_hello,
     )?;
 
     // client side
-    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
-        &client_mls_group,
-        RustCryptoProvider::new(),
-    )
-    .unwrap();
-    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
-        &client_mls_group,
-        RustCryptoProvider::new(),
-    )
-    .unwrap();
-
-    let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
-    let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());
-
-    let mut client_record_layer = tls_record::RecordLayer::from_traffic_secrets(
-        &client_exp,
-        &server_exp,
+    let mut client_record_layer = create_record_layer(
+        &client_group,
         tls_record::Role::Client,
+        RustCryptoProvider::new(),
     );
 
-    // server side
-    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
-        &client_mls_group,
-        RustCryptoProvider::new(),
-    )
-    .unwrap();
-    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
-        &client_mls_group,
-        RustCryptoProvider::new(),
-    )
-    .unwrap();
-
-    let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
-    let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());
-
-    let mut server_record_layer = tls_record::RecordLayer::from_traffic_secrets(
-        &client_exp,
-        &server_exp,
+    let mut server_record_layer = create_record_layer(
+        &server_group,
         tls_record::Role::Server,
+        RustCryptoProvider::new(),
     );
 
     let records = client_record_layer
@@ -180,17 +151,93 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let plaintext = server_record_layer.decrypt(&records[0]).unwrap();
-    println!("decrypted: {}", String::from_utf8_lossy(&plaintext.fragment));
+    println!(
+        "decrypted: {}",
+        String::from_utf8_lossy(&plaintext.fragment)
+    );
 
-    let mut client_mls_2_party = mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Initiator);
-    let connection_update = client_mls_2_party.create_connection_update(&mut client_mls_group).unwrap().unwrap();
+    let records = server_record_layer
+        .encrypt(
+            tls_record::ContentType::ApplicationData,
+            b"does it work from the server?",
+        )
+        .unwrap();
 
-    let mut server_mls_2_party = mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Responder);
-    let epock_key_update = server_mls_2_party.handle_connection_update(&mut server_group, connection_update).unwrap().unwrap();
+    let plaintext = client_record_layer.decrypt(&records[0]).unwrap();
+    println!(
+        "decrypted: {}",
+        String::from_utf8_lossy(&plaintext.fragment)
+    );
 
+    let mut client_mls_2_party =
+        mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Initiator);
+    let connection_update = client_mls_2_party
+        .create_connection_update(&mut client_group)
+        .unwrap()
+        .unwrap();
 
+    let mut server_mls_2_party =
+        mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Responder);
+    let epoch_key_update = server_mls_2_party
+        .handle_connection_update(&mut server_group, connection_update)
+        .unwrap()
+        .unwrap();
+    // start using new key material
+
+    server_record_layer = create_record_layer(
+        &server_group,
+        tls_record::Role::Server,
+        RustCryptoProvider::new(),
+    );
+
+    client_mls_2_party
+        .handle_epoch_key_update(&mut client_group, epoch_key_update)
+        .unwrap();
+    // start using new key material
+
+    client_record_layer = create_record_layer(
+        &client_group,
+        tls_record::Role::Client,
+        RustCryptoProvider::new(),
+    );
+
+    let records = server_record_layer
+        .encrypt(
+            tls_record::ContentType::ApplicationData,
+            b"hello from server after key rolling",
+        )
+        .unwrap();
+
+    let plaintext = client_record_layer.decrypt(&records[0]).unwrap();
+
+    println!(
+        "decrypted: {}",
+        String::from_utf8_lossy(&plaintext.fragment)
+    );
 
     Ok(())
+}
+
+fn create_record_layer<C: CryptoProvider + Clone>(
+    client_mls_group: &Group<impl MlsConfig>,
+    role: tls_record::Role,
+    crypto_provider: C,
+) -> tls_record::RecordLayer {
+    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
+        client_mls_group,
+        crypto_provider.clone(),
+    )
+    .unwrap();
+    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
+        client_mls_group,
+        crypto_provider.clone(),
+    )
+    .unwrap();
+
+    let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
+    let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());
+
+    tls_record::RecordLayer::from_traffic_secrets(&client_exp, &server_exp, role)
 }
 
 fn make_client<C: CryptoProvider + Clone>(
