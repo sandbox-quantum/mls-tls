@@ -1,19 +1,22 @@
 use std::collections::BTreeSet;
 
 use mls_rs::{
-    CipherSuite, Client, ExtensionList, Group, MlsMessage, client_builder::MlsConfig, crypto::SignatureSecretKey, error::{IntoAnyError, MlsError}, group::{
-        GroupContext, ReceivedMessage, Roster, proposal::{Proposal, ProposalType},
-    }, identity::SigningIdentity, mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
+    CipherSuite, Client, ExtensionList, Group, MlsMessage,
+    client_builder::MlsConfig,
+    crypto::SignatureSecretKey,
+    error::{IntoAnyError, MlsError},
+    group::{
+        GroupContext, ReceivedMessage, Roster,
+        proposal::{Proposal, ProposalType},
+    },
+    identity::SigningIdentity,
+    mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::TrustAnchor;
 
 use crate::{
-    make_client,
-    mls_two_party_profile_00::State::WaitingForEpochKeyUpdate,
-    print_tree,
-    tree_printer::{self, print_tree_detailed},
-    web_pki::{validate_client_credential, validate_server_credential},
+    make_client, mls_two_party_profile_00::State::{NotWaitingForEpochKeyUpdate, WaitingForEpochKeyUpdate}, print_tree, tree_printer::{self, print_tree_detailed}, web_pki::{validate_client_credential, validate_server_credential},
 };
 
 // draft-kohbrok-mls-two-party-profile-00
@@ -178,6 +181,35 @@ pub(crate) enum Role {
     Responder,
 }
 
+#[derive(Debug)]
+pub enum TwoPartyError {
+    Mls(MlsError),
+    UnexpectedEpochKeyUpdate,
+    EpochMismatch { expected: u64, got: u64 },
+}
+
+impl From<MlsError> for TwoPartyError {
+    fn from(e: MlsError) -> Self {
+        TwoPartyError::Mls(e)
+    }
+}
+
+impl std::fmt::Display for TwoPartyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TwoPartyError::Mls(e) => write!(f, "{e}"),
+            TwoPartyError::UnexpectedEpochKeyUpdate => {
+                write!(f, "received EpochKeyUpdate while not waiting for one")
+            }
+            TwoPartyError::EpochMismatch { expected, got } => {
+                write!(f, "epoch mismatch: expected {expected}, got {got}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TwoPartyError {}
+
 pub(crate) struct Mls2Party {
     state: State,
     role: Role,
@@ -209,6 +241,9 @@ impl Mls2Party {
             State::WaitingForEpochKeyUpdate => Ok(None),
             State::NotWaitingForEpochKeyUpdate => {
                 let update = group.propose_update(vec![])?;
+                // IMPLEMENTOR'S NOTE: I think we need to commit the propsal here already but not apply it until we've received the EpochKeyUpdate message
+                // but the order is not extremely clear in the draft.
+                group.commit(vec![]).unwrap();
                 // IMPLEMENTOR'S NOTE: it's not actually said very clearly when to start waiting for epoch key update
                 self.state = WaitingForEpochKeyUpdate;
 
@@ -232,20 +267,9 @@ impl Mls2Party {
             //     apply the commit and respond with an EpochKeyUpdate, where epoch
             //     is the group's new epoch
             (State::NotWaitingForEpochKeyUpdate, _) => {
-                let update = connection_update.update;
-                let received = group.process_incoming_message(update)?;
-                let proposal = match received {
-                    ReceivedMessage::Proposal(proposal_message_description) => {
-                        proposal_message_description.proposal
-                    }
-                    _ => unimplemented!(), // should send back some error
-                };
-                let update_proposal = match proposal {
-                    Proposal::Update(update_proposal) => update_proposal,
-                    _ => unimplemented!(), // need to send error there
-                };
-
+                let _received = group.process_incoming_message(connection_update.update)?;
                 // IMPLEMENTOR'S NOTE: what checks needs to be performed on the message?
+                // Checks are implemented as part of the `TwoPartyMlsRules` MlsRules implementation
                 group.commit(vec![])?;
                 group.apply_pending_commit()?;
 
@@ -262,13 +286,53 @@ impl Mls2Party {
                 //     EpochKeyUpdate, it MUST drop its locally pending commit and
                 //     validate and apply the commit as if it hadn't been waiting for an
                 //     EpochKeyUpdate
-                //
-                todo!()
+
+                group.clear_pending_commit();
+
+                group.clear_proposal_cache(); // TODO I think this is unnecessary. To chec
+
+                // Checks are implemented as part of the `TwoPartyMlsRules` MlsRules implementation
+                let _received = group.process_incoming_message(connection_update.update)?; // TODO what happens if it errors here? Means that the we dropped a commit unnecessarily. Is this a problem or does it just mean that the other member is misbehaving so all bets are off anyway? Do we stop the conneciton in this case anyway?
+
+                group.commit(vec![])?;
+                group.apply_pending_commit()?;
+
+
+                self.state = State::NotWaitingForEpochKeyUpdate;
+
+                Ok(Some(EpochKeyUpdate {
+                    epoch: group.current_epoch(),
+                }))
             }
         }
 
         // *  A party receiving a ConnectionUpdate MUST start using the key
         //     material of the new epoch after sending the EpochKeyUpdate
+    }
+
+    pub(crate) fn handle_epoch_key_update(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+        epoch_key_update: EpochKeyUpdate,
+    ) -> Result<(), TwoPartyError> {
+        match &self.state {
+            WaitingForEpochKeyUpdate => {
+                // IMPLEMENTOR's note, unclear what we're meant to do here with the epoch number.
+                let expected = group.current_epoch() + 1;
+                if expected != epoch_key_update.epoch {
+                    return Err(TwoPartyError::EpochMismatch {
+                        expected,
+                        got: epoch_key_update.epoch,
+                    });
+                }
+                group.apply_pending_commit()?;
+                self.state = NotWaitingForEpochKeyUpdate;
+                Ok(())
+            }
+            State::NotWaitingForEpochKeyUpdate => {
+                Err(TwoPartyError::UnexpectedEpochKeyUpdate)
+            }
+        }
     }
 }
 
