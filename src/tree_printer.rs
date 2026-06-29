@@ -1,9 +1,17 @@
 use mls_rs::{Group, client_builder::MlsConfig, group::Node};
 
+pub fn print_tree_detailed(group: &Group<impl MlsConfig>) {
+    print_tree_inner(group, true);
+}
+
 pub fn print_tree(group: &Group<impl MlsConfig>) {
+    print_tree_inner(group, false);
+}
+
+fn print_tree_inner(group: &Group<impl MlsConfig>, detailed: bool) {
     println!(
-        "Group id={:?} epoch={} cipher_suite={:?} my_index={}",
-        group.group_id(),
+        "Group id={} epoch={} cipher_suite={:?} my_index={}",
+        hex::encode(group.group_id()),
         group.current_epoch(),
         group.cipher_suite(),
         group.current_member_index()
@@ -17,7 +25,7 @@ pub fn print_tree(group: &Group<impl MlsConfig>) {
     }
 
     let root = tree_root(n);
-    print_node(nodes, root, n, "", true);
+    print_node(nodes, root, n, "", true, detailed);
 }
 
 fn tree_level(x: usize) -> u32 {
@@ -46,7 +54,7 @@ fn tree_right(x: usize, n: usize) -> usize {
     r
 }
 
-fn format_node(node: &Option<Node>, index: usize) -> String {
+fn format_node(node: &Option<Node>, index: usize, detailed: bool) -> String {
     match node {
         Some(Node::Leaf(leaf)) => {
             let cred = &leaf.signing_identity.credential;
@@ -62,25 +70,44 @@ fn format_node(node: &Option<Node>, index: usize) -> String {
             };
             let leaf_index = index / 2;
             let pk = &leaf.signing_identity.signature_key;
-            format!(
+            let mut s = format!(
                 "Leaf[{leaf_index}] {cred_str} pk={:02x?}..",
                 &pk.as_ref()[..4.min(pk.as_ref().len())]
-            )
+            );
+            if detailed {
+                s.push_str(&format!(
+                    "\n         sig_key={}",
+                    hex::encode(pk.as_ref())
+                ));
+                let hpke = &leaf.public_key;
+                s.push_str(&format!(
+                    "\n         hpke_pk={}",
+                    hex::encode(hpke.as_ref())
+                ));
+            }
+            s
         }
         Some(Node::Parent(parent)) => {
             let pk = &parent.public_key;
-            format!(
+            let mut s = format!(
                 "Parent pk={:02x?}..",
                 &pk.as_ref()[..4.min(pk.as_ref().len())]
-            )
+            );
+            if detailed {
+                s.push_str(&format!(
+                    "\n         hpke_pk={}",
+                    hex::encode(pk.as_ref())
+                ));
+            }
+            s
         }
         None => "(blank)".into(),
     }
 }
 
-fn print_node(nodes: &[Option<Node>], index: usize, n: usize, prefix: &str, is_last: bool) {
+fn print_node(nodes: &[Option<Node>], index: usize, n: usize, prefix: &str, is_last: bool, detailed: bool) {
     let connector = if is_last { "`- " } else { "|- " };
-    println!("{prefix}{connector}{}", format_node(&nodes[index], index));
+    println!("{prefix}{connector}{}", format_node(&nodes[index], index, detailed));
 
     if tree_level(index) == 0 {
         return;
@@ -90,6 +117,6 @@ fn print_node(nodes: &[Option<Node>], index: usize, n: usize, prefix: &str, is_l
     let left = tree_left(index);
     let right = tree_right(index, n);
 
-    print_node(nodes, left, n, &child_prefix, false);
-    print_node(nodes, right, n, &child_prefix, true);
+    print_node(nodes, left, n, &child_prefix, false, detailed);
+    print_node(nodes, right, n, &child_prefix, true, detailed);
 }

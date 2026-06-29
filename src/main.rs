@@ -180,7 +180,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
 
     let plaintext = server_record_layer.decrypt(&records[0]).unwrap();
-    println!("{}", String::from_utf8_lossy(&plaintext.fragment));
+    println!("decrypted: {}", String::from_utf8_lossy(&plaintext.fragment));
+
+    let mut client_mls_2_party = mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Initiator);
+    let connection_update = client_mls_2_party.create_connection_update(&mut client_mls_group).unwrap().unwrap();
+
+    let mut server_mls_2_party = mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Responder);
+    let epock_key_update = server_mls_2_party.handle_connection_update(&mut server_group, connection_update).unwrap().unwrap();
+
+
 
     Ok(())
 }
@@ -195,7 +203,7 @@ fn make_client<C: CryptoProvider + Clone>(
         .identity_provider(PassThroughIdentityProvider)
         .crypto_provider(crypto_provider)
         .signing_identity(signing_identity, signer, cipher_suite)
-        .mls_rules(DefaultMlsRules::default().with_commit_options(CommitOptions::default()))
+        .mls_rules(mls_two_party_profile_00::TwoPartyMlsRules::default()) // TODO: add a note there to say what this enforces
         .group_state_storage(InMemoryGroupStateStorage::default())
         .key_package_repo(InMemoryKeyPackageStorage::default())
         .psk_store(InMemoryPreSharedKeyStorage::default())
@@ -207,7 +215,6 @@ fn make_client<C: CryptoProvider + Clone>(
         // .identity_provider(identity_provider)                          TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .key_package_lifetime(lifetime)                                TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .key_package_repo(key_package_repo)                            TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
-        // .mls_rules(mls_rules)                                          TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .protocol_version(version)                                     TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .protocol_versions(versions)                                   TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES
         // .psk(psk_id, psk)                                              TODO: NEED TO REVIEW THESE FOR IMPLEMENTOR NOTES

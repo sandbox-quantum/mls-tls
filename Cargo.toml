@@ -1,5 +1,5 @@
 [package]
-name = "malaise-blaise"
+name = "mls-tls"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,6 +13,7 @@ webpki-roots = "1.0.8"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+hex = "0.4.3"
 
 [dev-dependencies]
 rcgen = "0.14"

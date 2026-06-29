@@ -1,19 +1,26 @@
 use std::collections::BTreeSet;
 
-use mls_rs::{CipherSuite, Client, ExtensionList, Group, MlsMessage, client_builder::MlsConfig, crypto::SignatureSecretKey, error::MlsError, identity::SigningIdentity};
+use mls_rs::{
+    CipherSuite, Client, ExtensionList, Group, MlsMessage, client_builder::MlsConfig, crypto::SignatureSecretKey, error::{IntoAnyError, MlsError}, group::{
+        GroupContext, ReceivedMessage, Roster, proposal::{Proposal, ProposalType},
+    }, identity::SigningIdentity, mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
+};
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::TrustAnchor;
 
-use crate::{make_client, print_tree, tree_printer, web_pki::{validate_client_credential, validate_server_credential}};
-
+use crate::{
+    make_client,
+    mls_two_party_profile_00::State::WaitingForEpochKeyUpdate,
+    print_tree,
+    tree_printer::{self, print_tree_detailed},
+    web_pki::{validate_client_credential, validate_server_credential},
+};
 
 // draft-kohbrok-mls-two-party-profile-00
 // https://datatracker.ietf.org/doc/draft-kohbrok-mls-two-party-profile/00/
 //
 
-
 // 3. Initial key agreement
-
 
 // struct {
 //     MLSMessage key_package;
@@ -96,8 +103,8 @@ pub(crate) fn initial_key_agreement_responder_1(
         .welcome_messages
         .into_iter()
         .next()
-        .unwrap();  // There's something to do here about commit options (yes that's the thing about ratchet tree (see at the end of this file))
-                    // commit options commitoptions
+        .unwrap(); // There's something to do here about commit options (yes that's the thing about ratchet tree (see at the end of this file))
+    // commit options commitoptions
     let server_hello = ServerHello { welcome };
     // IMPLEMENTOR NOTE: when is the commit actually applied? I assume the server can do it right away, but it would be good to make it explicit.
     responder_group.apply_pending_commit()?;
@@ -139,83 +146,231 @@ pub(crate) fn initial_key_agreement_initiator_2(
     Ok(initiator_group)
 }
 
-
 // 4.  Continuous key agreement
+//
+// struct {
+//     MLSMessage update
+// } ConnectionUpdate
+//
+// struct {
+//     uint64 epoch;
+// } EpochKeyUpdate
 
-//    struct {
-//      MLSMessage update
-//    } ConnectionUpdate
-
-//    struct {
-//      uint64 epoch;
-//    } EpochKeyUpdate
-pub struct ConnectionUpdate {
+// IMPLEMENTOR'S NOTE: here we're missing 'Unless it's an initiator that is waiting for an epoch key update)
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectionUpdate {
     update: MlsMessage,
 }
 
-pub struct EpochKeyUpdate {
+#[derive(Debug, Clone)]
+pub(crate) struct EpochKeyUpdate {
     epoch: u64,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum State {
+    WaitingForEpochKeyUpdate,
+    NotWaitingForEpochKeyUpdate,
+}
 
-//    After the initial key agreement phase, both parties can send an MLS
-//    commit with UpdatePath to update their key material.  To ensure that
-//    both agree on the order of such commits and thus on the currently
-//    used key material, they must follow the following rules.
+pub(crate) enum Role {
+    Initiator,
+    Responder,
+}
 
-//    *  Each party may send a ConnectionUpdate if they are not currently
-//       waiting for an EpochKeyUpdate to confirm a previous
-//       ConnectionUpdate
+pub(crate) struct Mls2Party {
+    state: State,
+    role: Role,
+}
 
-//    *  If either party receives a ConnectionUpdate and they're not
-//       currently waiting for an EpochKeyUpdate, they MUST validate and
-//       apply the commit and respond with an EpochKeyUpdate, where epoch
-//       is the group's new epoch
+// After the initial key agreement phase, both parties can send an MLS
+// commit with UpdatePath to update their key material.  To ensure that
+// both agree on the order of such commits and thus on the currently
+// used key material, they must follow the following rules.
 
-//    *  If the initiator receives a ConnectionUpdate while waiting for an
-//       EpochKeyUpdate, it MUST ignore the ConnectionUpdate and resume
-//       waiting
+impl Mls2Party {
+    pub(crate) fn new(role: Role) -> Self {
+        Self {
+            state: State::NotWaitingForEpochKeyUpdate,
+            role,
+        }
+    }
 
-//    *  If the responder receives a ConnectionUpdate while waiting for an
-//       EpochKeyUpdate, it MUST drop its locally pending commit and
-//       validate and apply the commit as if it hadn't been waiting for an
-//       EpochKeyUpdate
+    pub(crate) fn create_connection_update(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+    ) -> Result<Option<ConnectionUpdate>, MlsError> {
+        // *  Each party may send a ConnectionUpdate if they are not currently
+        //     waiting for an EpochKeyUpdate to confirm a previous
+        //     ConnectionUpdate
 
-//    *  A party receiving a ConnectionUpdate MUST start using the key
-//       material of the new epoch after sending the EpochKeyUpdate
+        // IMPLEMENTOR'S NOTE: the draft doesn't define what goes in the ConnectionUpdate commit message and how you generate it.
+        match self.state {
+            State::WaitingForEpochKeyUpdate => Ok(None),
+            State::NotWaitingForEpochKeyUpdate => {
+                let update = group.propose_update(vec![])?;
+                // IMPLEMENTOR'S NOTE: it's not actually said very clearly when to start waiting for epoch key update
+                self.state = WaitingForEpochKeyUpdate;
 
-//    *  A party sending a ConnectionUpdate MUST wait until they receive
-//       the corresponding EpochKeyUpdate before they start using the key
-//       material of the new epoch
+                Ok(Some(ConnectionUpdate { update }))
+            }
+        }
+    }
 
-// 5.  Resumption
+    pub(crate) fn handle_connection_update(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+        connection_update: ConnectionUpdate,
+    ) -> Result<Option<EpochKeyUpdate>, MlsError> {
+        // TODO: WIP — incomplete match expression
+        // match connection_update.update.into_proposal_reference(&CipherSuite::CURVE25519_AES128)
+        // dbg!(&connection_update.update);
+        match (&self.state, &self.role) {
+            //
+            // *  If either party receives a ConnectionUpdate and they're not
+            //     currently waiting for an EpochKeyUpdate, they MUST validate and
+            //     apply the commit and respond with an EpochKeyUpdate, where epoch
+            //     is the group's new epoch
+            (State::NotWaitingForEpochKeyUpdate, _) => {
+                let update = connection_update.update;
+                let received = group.process_incoming_message(update)?;
+                let proposal = match received {
+                    ReceivedMessage::Proposal(proposal_message_description) => {
+                        proposal_message_description.proposal
+                    }
+                    _ => unimplemented!(), // should send back some error
+                };
+                let update_proposal = match proposal {
+                    Proposal::Update(update_proposal) => update_proposal,
+                    _ => unimplemented!(), // need to send error there
+                };
 
-//    Either party may resume a previously interrupted protocol session
-//    based on that session's group state.  The party initiating the
-//    resumption becomes the initiator.
+                // IMPLEMENTOR'S NOTE: what checks needs to be performed on the message?
+                group.commit(vec![])?;
+                group.apply_pending_commit()?;
 
-//    struct {
-//      MLSMessage commit;
-//    } ResumptionRequest
+                Ok(Some(EpochKeyUpdate {
+                    epoch: group.current_epoch(),
+                }))
+            }
+            // *  If the initiator receives a ConnectionUpdate while waiting for an
+            //     EpochKeyUpdate, it MUST ignore the ConnectionUpdate and resume
+            //     waiting
+            (State::WaitingForEpochKeyUpdate, Role::Initiator) => Ok(None),
+            (State::WaitingForEpochKeyUpdate, Role::Responder) => {
+                // *  If the responder receives a ConnectionUpdate while waiting for an
+                //     EpochKeyUpdate, it MUST drop its locally pending commit and
+                //     validate and apply the commit as if it hadn't been waiting for an
+                //     EpochKeyUpdate
+                //
+                todo!()
+            }
+        }
 
-//    struct {
-//      MLSMessage commit;
-//    } ResumptionResponse
+        // *  A party receiving a ConnectionUpdate MUST start using the key
+        //     material of the new epoch after sending the EpochKeyUpdate
+    }
+}
 
-//    The initiator sends a Resumption message to the responder.  If the
-//    initiator was waiting for an EpochKeyUpdate while the connection was
-//    interrupted, it MUST include the commit from the last
-//    ConnectionUpdate in the Resumption message.  The initiator MUST then
-//    wait for a ResumptionResponse.
+// ---------------------------------------------------------------------------
+// MlsRules for two-party profile
+// ---------------------------------------------------------------------------
 
-//    The responder receiving a ResumptionRequest MUST validate and apply
-//    the commit in the ResumptionRequest and create a commit with
-//    UpdatPath to send back as part of a ResumptionResponse.
+// draft-kohbrok-mls-two-party-profile §4:
+// > "After the initial key agreement phase, both parties can send an MLS
+// >  commit with UpdatePath to update their key material."
+//
+// On Receive, only Update proposals are allowed. All other proposal types
+// (Add, Remove, PSK, ReInit, ExternalInit, GroupContextExtensions, custom,
+// and any future types) are rejected. This is a deny-by-default allow-list.
+//
+// On Send, proposals pass through — we control what we send.
+//
+// The initial Add (epoch 0→1) does not conflict because:
+// - The responder creates it via commit_builder (CommitDirection::Send)
+// - The initiator joins via Welcome (never goes through filter_proposals)
 
-//    If one of the parties receives a ResumptionRequest while waiting for
-//    a ResumptionResponse, their reaction depends whether they were the
-//    initial initiator or responder when the connection was first
-//    established.  The initial initiator MUST drop the ResumptionRequest
-//    and continue waiting.  The initial responder MUST drop its pending
-//    commit and instead validate and apply the incoming commit before
-//    responding with a fresh commit as part of a ResumptionResponse.
+#[derive(Debug)]
+pub enum TwoPartyRulesError {
+    DisallowedProposalType(ProposalType),
+    ExpectedOneProposal(usize),
+}
+
+impl std::fmt::Display for TwoPartyRulesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TwoPartyRulesError::DisallowedProposalType(t) => {
+                write!(f, "disallowed proposal type in two-party profile: {t:?}")
+            }
+            TwoPartyRulesError::ExpectedOneProposal(n) => {
+                write!(f, "expected exactly one proposal, got {n}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TwoPartyRulesError {}
+
+impl IntoAnyError for TwoPartyRulesError {
+    fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
+        Ok(self.into())
+    }
+}
+
+#[derive(Clone)]
+pub struct TwoPartyMlsRules {
+    commit_options: CommitOptions,
+    encryption_options: EncryptionOptions,
+}
+
+impl Default for TwoPartyMlsRules {
+    fn default() -> Self {
+        Self {
+            commit_options: CommitOptions::default(),
+            encryption_options: EncryptionOptions::default(),
+        }
+    }
+}
+
+impl mls_rs::MlsRules for TwoPartyMlsRules {
+    type Error = TwoPartyRulesError;
+
+    fn filter_proposals(
+        &self,
+        direction: CommitDirection,
+        _source: CommitSource,
+        _roster: &Roster<'_>,
+        _context: &GroupContext,
+        proposals: ProposalBundle,
+    ) -> Result<ProposalBundle, Self::Error> {
+        if direction == CommitDirection::Receive {
+            let count = proposals.length();
+            if count != 1 {
+                return Err(TwoPartyRulesError::ExpectedOneProposal(count));
+            }
+            let mut proposal_types = proposals.proposal_types();
+            let proposal_type = proposal_types.next().unwrap();
+            if proposal_type != ProposalType::UPDATE {
+                return Err(TwoPartyRulesError::DisallowedProposalType(proposal_type));
+            }
+        }
+        Ok(proposals)
+    }
+
+    fn commit_options(
+        &self,
+        _roster: &Roster<'_>,
+        _context: &GroupContext,
+        _proposals: &ProposalBundle,
+    ) -> Result<CommitOptions, Self::Error> {
+        Ok(self.commit_options.clone())
+    }
+
+    fn encryption_options(
+        &self,
+        _roster: &Roster<'_>,
+        _context: &GroupContext,
+    ) -> Result<EncryptionOptions, Self::Error> {
+        Ok(self.encryption_options.clone())
+    }
+}

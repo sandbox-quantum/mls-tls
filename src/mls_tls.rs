@@ -1,5 +1,8 @@
 // https://www.ietf.org/archive/id/draft-kohbrok-mls-tls-00.html
 
+
+// IMPLEMENTOR'S QUESTION: does MLS-TLS support the TLS server resuming the connection? How does that even work at the transport level?
+
 // > 6. Deriving keys for record layer protection
 // > Both after the initial key agreement phase and the resumption phase, initiator and responder derive key material from the MLS group created during the initial key agreement phase.
 // >
@@ -14,8 +17,7 @@
 // > Where MLS-Exporter is defined in [RFC9420] and Length is the size of the secret required by the TLS record layer.
 
 use mls_rs::{
-    CipherSuite, CipherSuiteProvider, CryptoProvider, Group, client_builder::MlsConfig,
-    crypto::Secret, error::MlsError,
+    CipherSuite, CipherSuiteProvider, CryptoProvider, Group, MlsMessage, client_builder::MlsConfig, crypto::Secret, error::MlsError,
 };
 
 /// |    |             |                  |                  |                  |
@@ -70,3 +72,6 @@ pub(crate) fn derive_client_application_traffic_secret(
 ) -> Result<Secret, MlsError> {
     derive_key(group, crypto_provider, b"MLS-TLS c ap traffic")
 }
+
+
+// IMPLEMENTOR'S QUESTION: what happens to all to the TLS key update mechanism in MLS TLS. Is i tcompletely replaced by MLS-TLS or happen in parallel? 
