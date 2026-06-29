@@ -240,14 +240,13 @@ impl Mls2Party {
         match self.state {
             State::WaitingForEpochKeyUpdate => Ok(None),
             State::NotWaitingForEpochKeyUpdate => {
-                let update = group.propose_update(vec![])?;
-                // IMPLEMENTOR'S NOTE: I think we need to commit the propsal here already but not apply it until we've received the EpochKeyUpdate message
-                // but the order is not extremely clear in the draft.
-                group.commit(vec![]).unwrap();
-                // IMPLEMENTOR'S NOTE: it's not actually said very clearly when to start waiting for epoch key update
+                group.propose_update(vec![])?;
+                let commit = group.commit(vec![])?;
                 self.state = WaitingForEpochKeyUpdate;
 
-                Ok(Some(ConnectionUpdate { update }))
+                Ok(Some(ConnectionUpdate {
+                    update: commit.commit_message,
+                }))
             }
         }
     }
@@ -267,11 +266,7 @@ impl Mls2Party {
             //     apply the commit and respond with an EpochKeyUpdate, where epoch
             //     is the group's new epoch
             (State::NotWaitingForEpochKeyUpdate, _) => {
-                let _received = group.process_incoming_message(connection_update.update)?;
-                // IMPLEMENTOR'S NOTE: what checks needs to be performed on the message?
-                // Checks are implemented as part of the `TwoPartyMlsRules` MlsRules implementation
-                group.commit(vec![])?;
-                group.apply_pending_commit()?;
+                group.process_incoming_message(connection_update.update)?;
 
                 Ok(Some(EpochKeyUpdate {
                     epoch: group.current_epoch(),
@@ -356,18 +351,14 @@ impl Mls2Party {
 
 #[derive(Debug)]
 pub enum TwoPartyRulesError {
-    DisallowedProposalType(ProposalType),
-    ExpectedOneProposal(usize),
+    ExpectedOneUpdateProposal,
 }
 
 impl std::fmt::Display for TwoPartyRulesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TwoPartyRulesError::DisallowedProposalType(t) => {
-                write!(f, "disallowed proposal type in two-party profile: {t:?}")
-            }
-            TwoPartyRulesError::ExpectedOneProposal(n) => {
-                write!(f, "expected exactly one proposal, got {n}")
+            TwoPartyRulesError::ExpectedOneUpdateProposal => {
+                write!(f, "expected at most one update proposal and no other proposal types")
             }
         }
     }
@@ -408,14 +399,10 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
         proposals: ProposalBundle,
     ) -> Result<ProposalBundle, Self::Error> {
         if direction == CommitDirection::Receive {
-            let count = proposals.length();
-            if count != 1 {
-                return Err(TwoPartyRulesError::ExpectedOneProposal(count));
-            }
-            let mut proposal_types = proposals.proposal_types();
-            let proposal_type = proposal_types.next().unwrap();
-            if proposal_type != ProposalType::UPDATE {
-                return Err(TwoPartyRulesError::DisallowedProposalType(proposal_type));
+            let has_non_update = proposals.length() != proposals.update_proposals().len();
+            let too_many_updates = proposals.update_proposals().len() > 1;
+            if has_non_update || too_many_updates {
+                return Err(TwoPartyRulesError::ExpectedOneUpdateProposal);
             }
         }
         Ok(proposals)
