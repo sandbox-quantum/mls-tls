@@ -130,6 +130,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         server_hello,
     )?;
 
+    tree_printer::print_tree_detailed(&client_group);
+
     // client side
     let mut client_record_layer = create_record_layer(
         &client_group,
@@ -195,6 +197,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap();
     // start using new key material
 
+    tree_printer::print_tree_detailed(&client_group);
+
     client_record_layer = create_record_layer(
         &client_group,
         tls_record::Role::Client,
@@ -215,24 +219,58 @@ fn main() -> Result<(), Box<dyn Error>> {
         String::from_utf8_lossy(&plaintext.fragment)
     );
 
+    // Resumption
+
+    let resumption_request = client_mls_2_party
+        .create_resumption_request(&mut client_group)
+        .unwrap();
+
+    let resumption_response = server_mls_2_party
+        .handle_resumption_request(&mut server_group, resumption_request)
+        .unwrap()
+        .unwrap();
+
+    let mut server_record_layer = create_record_layer(
+        &mut server_group,
+        tls_record::Role::Server,
+        RustCryptoProvider::new(),
+    );
+
+    client_mls_2_party
+        .handle_resumption_response(&mut client_group, resumption_response)
+        .unwrap();
+
+    let mut client_record_layer = create_record_layer(
+        &mut client_group,
+        tls_record::Role::Client,
+        RustCryptoProvider::new(),
+    );
+
+    let records = client_record_layer
+        .encrypt(
+            tls_record::ContentType::ApplicationData,
+            b"Sent by client after receiving resumption response",
+        )
+        .unwrap();
+
+    let plaintext = server_record_layer.decrypt(&records[0]).unwrap();
+
+    println!("decrypted: {}", String::from_utf8_lossy(&plaintext.fragment));
+
     Ok(())
 }
 
 fn create_record_layer<C: CryptoProvider + Clone>(
-    client_mls_group: &Group<impl MlsConfig>,
+    mls_group: &Group<impl MlsConfig>,
     role: tls_record::Role,
     crypto_provider: C,
 ) -> tls_record::RecordLayer {
-    let client_application_traffic_secret = mls_tls::derive_client_application_traffic_secret(
-        client_mls_group,
-        crypto_provider.clone(),
-    )
-    .unwrap();
-    let server_application_traffic_secret = mls_tls::derive_server_application_traffic_secret(
-        client_mls_group,
-        crypto_provider.clone(),
-    )
-    .unwrap();
+    let client_application_traffic_secret =
+        mls_tls::derive_client_application_traffic_secret(mls_group, crypto_provider.clone())
+            .unwrap();
+    let server_application_traffic_secret =
+        mls_tls::derive_server_application_traffic_secret(mls_group, crypto_provider.clone())
+            .unwrap();
 
     let client_exp = HkdfExpanderSha256::from_prk(client_application_traffic_secret.as_bytes());
     let server_exp = HkdfExpanderSha256::from_prk(server_application_traffic_secret.as_bytes());

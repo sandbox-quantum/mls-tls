@@ -16,7 +16,11 @@ use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::TrustAnchor;
 
 use crate::{
-    make_client, mls_two_party_profile_00::State::{NotWaitingForEpochKeyUpdate, WaitingForEpochKeyUpdate}, print_tree, tree_printer::{self, print_tree_detailed}, web_pki::{validate_client_credential, validate_server_credential},
+    make_client,
+    mls_two_party_profile_00::State::{NotWaiting, WaitingForEpochKeyUpdate},
+    print_tree,
+    tree_printer::{self, print_tree_detailed},
+    web_pki::{validate_client_credential, validate_server_credential},
 };
 
 // draft-kohbrok-mls-two-party-profile-00
@@ -173,9 +177,11 @@ pub(crate) struct EpochKeyUpdate {
 #[derive(Debug, PartialEq)]
 pub(crate) enum State {
     WaitingForEpochKeyUpdate,
-    NotWaitingForEpochKeyUpdate,
+    NotWaiting,
+    WaitingForResumptionResponse,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Role {
     Initiator,
     Responder,
@@ -212,6 +218,7 @@ impl std::error::Error for TwoPartyError {}
 
 pub(crate) struct Mls2Party {
     state: State,
+    initial_role: Role,
     role: Role,
 }
 
@@ -223,7 +230,8 @@ pub(crate) struct Mls2Party {
 impl Mls2Party {
     pub(crate) fn new(role: Role) -> Self {
         Self {
-            state: State::NotWaitingForEpochKeyUpdate,
+            state: State::NotWaiting,
+            initial_role: role.clone(),
             role,
         }
     }
@@ -239,8 +247,9 @@ impl Mls2Party {
         // IMPLEMENTOR'S NOTE: the draft doesn't define what goes in the ConnectionUpdate commit message and how you generate it.
         match self.state {
             State::WaitingForEpochKeyUpdate => Ok(None),
-            State::NotWaitingForEpochKeyUpdate => {
-                group.propose_update(vec![])?;
+            State::NotWaiting => {
+                group.propose_update(vec![])?; // Note: this is automatically added when `path_required` is set as a commit options when
+                // creating the group. We add it to be explicit.
                 let commit = group.commit(vec![])?;
                 self.state = WaitingForEpochKeyUpdate;
 
@@ -248,6 +257,7 @@ impl Mls2Party {
                     update: commit.commit_message,
                 }))
             }
+            State::WaitingForResumptionResponse => todo!(),
         }
     }
 
@@ -265,7 +275,7 @@ impl Mls2Party {
             //     currently waiting for an EpochKeyUpdate, they MUST validate and
             //     apply the commit and respond with an EpochKeyUpdate, where epoch
             //     is the group's new epoch
-            (State::NotWaitingForEpochKeyUpdate, _) => {
+            (State::NotWaiting, _) => {
                 group.process_incoming_message(connection_update.update)?;
 
                 Ok(Some(EpochKeyUpdate {
@@ -283,7 +293,6 @@ impl Mls2Party {
                 //     EpochKeyUpdate
 
                 group.clear_pending_commit();
-
                 group.clear_proposal_cache(); // TODO I think this is unnecessary. To chec
 
                 // Checks are implemented as part of the `TwoPartyMlsRules` MlsRules implementation
@@ -292,12 +301,14 @@ impl Mls2Party {
                 group.commit(vec![])?;
                 group.apply_pending_commit()?;
 
-
-                self.state = State::NotWaitingForEpochKeyUpdate;
+                self.state = State::NotWaiting;
 
                 Ok(Some(EpochKeyUpdate {
                     epoch: group.current_epoch(),
                 }))
+            }
+            (State::WaitingForResumptionResponse, _) => {
+                todo!() // TODO claude return err or ignore... // IMPLEMENTOR'S NOTE: This is actually not defined 
             }
         }
 
@@ -321,11 +332,12 @@ impl Mls2Party {
                     });
                 }
                 group.apply_pending_commit()?;
-                self.state = NotWaitingForEpochKeyUpdate;
+                self.state = NotWaiting;
                 Ok(())
             }
-            State::NotWaitingForEpochKeyUpdate => {
-                Err(TwoPartyError::UnexpectedEpochKeyUpdate)
+            State::NotWaiting => Err(TwoPartyError::UnexpectedEpochKeyUpdate),
+            State::WaitingForResumptionResponse => {
+                todo!() // IMPLEMENTOR'S NOTE: this is actually not defined in the draft spec. 
             }
         }
     }
@@ -358,7 +370,10 @@ impl std::fmt::Display for TwoPartyRulesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TwoPartyRulesError::ExpectedOneUpdateProposal => {
-                write!(f, "expected at most one update proposal and no other proposal types")
+                write!(
+                    f,
+                    "expected at most one update proposal and no other proposal types"
+                )
             }
         }
     }
@@ -425,3 +440,160 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
         Ok(self.encryption_options.clone())
     }
 }
+
+// 5.  Resumption
+
+//    Either party may resume a previously interrupted protocol session
+//    based on that session's group state.  The party initiating the
+//    resumption becomes the initiator.
+//
+//    struct {
+//      MLSMessage commit;
+//    } ResumptionRequest
+//
+//    struct {
+//      MLSMessage commit;
+//    } ResumptionResponse
+//
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResumptionRequest {
+    pub(crate) commit: MlsMessage,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResumptionResponse {
+    pub(crate) commit: MlsMessage,
+}
+
+impl Mls2Party {
+    pub(crate) fn create_resumption_request(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+    ) -> Result<ResumptionRequest, TwoPartyError> {
+        //    The initiator sends a Resumption message to the responder.
+
+        match &self.state {
+            // If the initiator was waiting for an EpochKeyUpdate while the connection was
+            // interrupted, it MUST include the commit from the last
+            // ConnectionUpdate in the Resumption message.
+            State::WaitingForEpochKeyUpdate => {
+                // TODO
+                todo!()
+            }
+            State::NotWaiting => {
+                group.propose_update(vec![])?; // TODO: I think that's unnecessary to rotate the HPKE
+                let commit = group.commit(vec![])?;
+
+                self.state = State::WaitingForResumptionResponse;
+                self.role = Role::Initiator; // Check when that state must change then.
+                Ok(ResumptionRequest {
+                    commit: commit.commit_message,
+                })
+            }
+            State::WaitingForResumptionResponse => {
+                panic!("Shouldn't happen send error")
+            }
+        }
+
+        // The initiator MUST then wait for a ResumptionResponse.
+    }
+
+    pub(crate) fn handle_resumption_request(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+        resumption_request: ResumptionRequest,
+    ) -> Result<Option<ResumptionResponse>, TwoPartyError> {
+        if self.role != Role::Responder {
+            // TODO
+            panic!("This shouldn't happen let's use type to enforce this.")
+        }
+
+        match self.state {
+            WaitingForEpochKeyUpdate => todo!(), // IMPLEMENTOR'S NOTE: note define what happens where
+            NotWaiting => {
+                group.clear_pending_commit();
+                group.clear_proposal_cache(); // TODO I think this is unnecessary. To check
+
+                self.role = Role::Responder;
+
+                //    The responder receiving a ResumptionRequest MUST validate and apply
+                //    the commit in the ResumptionRequest and create a commit with
+                //    UpdatPath to send back as part of a ResumptionResponse.
+
+                group
+                    .process_incoming_message(resumption_request.commit)
+                    .unwrap();
+
+                let commit = group.commit(vec![])?;
+                group.apply_pending_commit().unwrap();
+
+                // IMPLEMENTOR'S NOTE: TODO investigate more: What happens if the responder receives two resumption requests? Are we going to get out of sync.
+
+                Ok(Some(ResumptionResponse {
+                    commit: commit.commit_message,
+                }))
+            }
+            State::WaitingForResumptionResponse => {
+                //    If one of the parties receives a ResumptionRequest while waiting for
+                //    a ResumptionResponse, their reaction depends whether they were the
+                //    initial initiator or responder when the connection was first
+                //    established.  The initial initiator MUST drop the ResumptionRequest
+                //    and continue waiting.  The initial responder MUST drop its pending
+                //    commit and instead validate and apply the incoming commit before
+                //    responding with a fresh commit as part of a ResumptionResponse.
+                match self.initial_role {
+                    Role::Initiator => Ok(None),
+                    Role::Responder => {
+                        self.role = Role::Responder;
+                        group.clear_proposal_cache(); // TODO check if that's necessary
+                        group.clear_pending_commit();
+
+                        group
+                            .process_incoming_message(resumption_request.commit)
+                            .unwrap();
+                        group.apply_pending_commit();
+
+                        let commit = group.commit(vec![]).unwrap();
+                        group.apply_pending_commit().unwrap();
+
+                        self.state = State::NotWaiting;
+
+                        Ok(Some(ResumptionResponse {
+                            commit: commit.commit_message,
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_resumption_response(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+        resumption_response: ResumptionResponse,
+    ) -> Result<(), MlsError> {
+        if self.role == Role::Responder {
+            unimplemented!("Shouldn't happen what sort of error should we do there?");
+        }
+
+        match self.state {
+            WaitingForEpochKeyUpdate => {
+                unimplemented!("What should we do there?")
+            }
+            NotWaiting => {
+                unimplemented!("What should do there?")
+            }
+            State::WaitingForResumptionResponse => {
+                group.apply_pending_commit()?;
+                group.process_incoming_message(resumption_response.commit)?;
+                self.state = State::NotWaiting;
+                Ok(())
+            }
+        }
+    }
+}
+
+// IMPLEMENTOR'S NOTE: no error path has been defined in case the resumption is not possible.
+
+// IMPLEMENTOR's NOTE: what happens if data is sent after the resumption request has been sent, but then 
