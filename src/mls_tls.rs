@@ -20,6 +20,14 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, CryptoProvider, Group, MlsMessage, client_builder::MlsConfig, crypto::Secret, error::MlsError,
 };
 
+#[derive(Debug, thiserror::Error)]
+pub enum MlsTlsError {
+    #[error("unsupported cipher suite: {0:?}")]
+    UnsupportedCipherSuite(CipherSuite),
+    #[error("MLS secret export failed")]
+    Export(#[from] MlsError),
+}
+
 /// |    |             |                  |                  |                  |
 /// |----|-------------|------------------|------------------|------------------|
 /// | ID | KEM         | AEAD             | Hash Function    | Signature Scheme |
@@ -35,7 +43,7 @@ fn derive_key(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,
     label: &[u8],
-) -> Result<Secret, MlsError> {
+) -> Result<Secret, MlsTlsError> {
     // IMPLEMENTOR'S NOTE (draft-kohbrok-mls-tls-00 §6): The draft does not specify how MLS cipher
     // suites map to TLS AEAD algorithms. We assume MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
     // maps to TLS_AES_128_GCM_SHA256 (AES-128-GCM for record protection, SHA-256 for HKDF).
@@ -49,27 +57,28 @@ fn derive_key(
     // The actual HKDF derivation lives in mls_tls.rs; this module consumes the derived key and IV.
     let ciphersuite_provider = crypto_provider
         .cipher_suite_provider(group.cipher_suite())
-        .unwrap();
+        .ok_or_else(|| MlsTlsError::UnsupportedCipherSuite(group.cipher_suite()))?;
     let len = ciphersuite_provider.kdf_extract_size();
 
-    group.export_secret(
+    let secret = group.export_secret(
         label,
         &[], // TODO: Figure out what context is, and should it be set for MLS-TLS?
         len,
-    )
+    )?;
+    Ok(secret)
 }
 
 pub(crate) fn derive_server_application_traffic_secret(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,
-) -> Result<Secret, MlsError> {
+) -> Result<Secret, MlsTlsError> {
     derive_key(group, crypto_provider, b"MLS-TLS s ap traffic")
 }
 
 pub(crate) fn derive_client_application_traffic_secret(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,
-) -> Result<Secret, MlsError> {
+) -> Result<Secret, MlsTlsError> {
     derive_key(group, crypto_provider, b"MLS-TLS c ap traffic")
 }
 

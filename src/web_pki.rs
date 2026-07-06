@@ -8,25 +8,23 @@ use mls_rs::{
 use mls_rs_core::identity::MemberValidationContext;
 use rustls_pki_types::{CertificateDer, InvalidDnsNameError, ServerName, TrustAnchor, UnixTime};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, thiserror::Error)]
 pub enum WebPkiIdentityError {
+    #[error("credential is not an X.509 certificate")]
     NotX509,
+    #[error("X.509 certificate chain is empty")]
     EmptyChain,
-    ChainValidation(String),
-    NameValidation(String),
+    #[error("failed to parse end-entity certificate")]
+    ParseCert(#[source] webpki::Error),
+    #[error("certificate chain validation failed")]
+    ChainValidation(#[source] webpki::Error),
+    #[error("certificate subject-name validation failed")]
+    NameValidation(#[source] webpki::Error),
 }
-
-impl std::fmt::Display for WebPkiIdentityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl std::error::Error for WebPkiIdentityError {}
 
 impl IntoAnyError for WebPkiIdentityError {
     fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
-        Ok(format!("{self:?}").into())
+        Ok(self.into())
     }
 }
 
@@ -91,8 +89,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
 
         let leaf_der = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
         let leaf_cert_der = CertificateDer::from(leaf_der.as_ref());
-        let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der)
-            .map_err(|e| WebPkiIdentityError::ChainValidation(e.to_string()))?;
+        let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der).map_err(WebPkiIdentityError::ParseCert)?;
 
         let intermediates: Vec<CertificateDer> = chain
             .iter()
@@ -114,13 +111,13 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
                 None,
                 None,
             )
-            .map_err(|err| WebPkiIdentityError::ChainValidation(err.to_string()))?;
+            .map_err(WebPkiIdentityError::ChainValidation)?;
 
         match &self.peer_validation {
             PeerValidation::ServerName(server_name) => {
                 ee_cert
                     .verify_is_valid_for_subject_name(server_name)
-                    .map_err(|e| WebPkiIdentityError::NameValidation(e.to_string()))?;
+                    .map_err(WebPkiIdentityError::NameValidation)?;
             }
             PeerValidation::NoSubjectValidation => {}
         }
@@ -190,8 +187,7 @@ pub fn validate_server_credential(
 
     let leaf_der = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
     let leaf_cert_der = CertificateDer::from(leaf_der.as_ref());
-    let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der)
-        .map_err(|e| WebPkiIdentityError::ChainValidation(e.to_string()))?;
+    let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der).map_err(WebPkiIdentityError::ParseCert)?;
 
     let intermediates: Vec<CertificateDer> = chain
         .iter()
@@ -209,12 +205,10 @@ pub fn validate_server_credential(
             None,
             None,
         )
-        .map_err(|err| WebPkiIdentityError::ChainValidation(err.to_string()))?;
+        .map_err(WebPkiIdentityError::ChainValidation)?;
 
     if let Some(server_name) = expected_name {
-        ee_cert
-            .verify_is_valid_for_subject_name(server_name)
-            .map_err(|e| WebPkiIdentityError::NameValidation(e.to_string()))?;
+        ee_cert.verify_is_valid_for_subject_name(server_name).map_err(WebPkiIdentityError::NameValidation)?;
     }
 
     Ok(())

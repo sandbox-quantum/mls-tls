@@ -78,34 +78,28 @@ pub struct TlsPlaintext {
 //     opaque encrypted_record[TLSCiphertext.length];
 // } TLSCiphertext;
 
-#[derive(Debug)]
+// A leaf error type: variants are exhaustively pattern-matched in the tests via `matches!`
+// and exercised by RFC-8448 vectors, so the variant shapes are kept as-is (no backtrace
+// fields). The wrapped `aes_gcm`/`hkdf` errors are opaque, so there is no source to chain.
+#[derive(Debug, thiserror::Error)]
 pub enum RecordError {
+    #[error("plaintext exceeds 2^14 bytes")]
     PayloadTooLarge,
+    #[error("ciphertext exceeds 2^14 + 256 bytes")]
     RecordOverflow,
+    #[error("invalid TLS record header")]
     InvalidHeader,
+    #[error("AEAD decryption failed")]
     DecryptionFailed,
+    #[error("invalid content type: {0}")]
     InvalidContentType(u8),
+    #[error("decrypted payload is all zeros")]
     EmptyInnerPlaintext,
+    #[error("sequence number would overflow")]
     SequenceNumberOverflow,
+    #[error("HKDF expand failed")]
     HkdfExpandError,
 }
-
-impl std::fmt::Display for RecordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecordError::PayloadTooLarge => write!(f, "plaintext exceeds 2^14 bytes"),
-            RecordError::RecordOverflow => write!(f, "ciphertext exceeds 2^14 + 256 bytes"),
-            RecordError::InvalidHeader => write!(f, "invalid TLS record header"),
-            RecordError::DecryptionFailed => write!(f, "AEAD decryption failed"),
-            RecordError::InvalidContentType(v) => write!(f, "invalid content type: {v}"),
-            RecordError::EmptyInnerPlaintext => write!(f, "decrypted payload is all zeros"),
-            RecordError::SequenceNumberOverflow => write!(f, "sequence number would overflow"),
-            RecordError::HkdfExpandError => write!(f, "HKDF expand failed"),
-        }
-    }
-}
-
-impl std::error::Error for RecordError {}
 
 // RFC 8446 §5.1:
 // > "The length MUST NOT exceed 2^14 bytes."

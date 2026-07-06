@@ -80,7 +80,25 @@ fn print_tree(group: &Group<impl MlsConfig>) {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+/// Print an error together with its full `source()` chain, so the origin is easy to find.
+/// Set `RUST_BACKTRACE=1` to also populate the `Backtrace` captured inside each typed error.
+fn report(err: &dyn Error) {
+    eprintln!("error: {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
+}
+
+fn main() {
+    if let Err(err) = run() {
+        report(err.as_ref());
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     // Load test CA + server certificate from fixtures (cargo run --example generate_fixtures)
     let fixtures = Path::new("fixtures");
     let ca_cert_der = fs::read(fixtures.join("ca_cert.der"))?;

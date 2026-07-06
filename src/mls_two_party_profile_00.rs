@@ -20,7 +20,7 @@ use crate::{
     mls_two_party_profile_00::State::{NotWaiting, WaitingForEpochKeyUpdate},
     print_tree,
     tree_printer::{self, print_tree_detailed},
-    web_pki::{validate_client_credential, validate_server_credential},
+    web_pki::{WebPkiIdentityError, validate_client_credential, validate_server_credential},
 };
 
 // draft-kohbrok-mls-two-party-profile-00
@@ -69,23 +69,27 @@ pub(crate) fn initial_key_agreement_responder_1(
     signing_identity: SigningIdentity,
     signer: SignatureSecretKey,
     cipher_suite: CipherSuite,
-) -> Result<(ServerHello, Client<impl MlsConfig>, Group<impl MlsConfig>), MlsError> {
+) -> Result<(ServerHello, Client<impl MlsConfig>, Group<impl MlsConfig>), TwoPartyError> {
     // > The responder inspects the KeyPackage and checks whether it supports
     // > the offered ciphersuite and whether the initiator has sufficient
     // > capabilities to support the connection.
-    let initiator_key_package = client_hello.key_package.as_key_package().unwrap();
+    let initiator_key_package =
+        client_hello
+            .key_package
+            .as_key_package()
+            .ok_or(TwoPartyError::NotAKeyPackage)?;
     let initiator_offered_ciphersuite = initiator_key_package.cipher_suite;
     let server_supported_ciphersuites = CipherSuite::all().collect::<BTreeSet<_>>();
 
     // IMPLEMENTOR NOTE: MLS 2-party profile doesn't support ciphersuite negotiation.
 
     if !server_supported_ciphersuites.contains(&initiator_offered_ciphersuite) {
-        panic!("Unsupported ciphersuite: {initiator_offered_ciphersuite:?}");
+        return Err(TwoPartyError::UnsupportedCipherSuite(initiator_offered_ciphersuite));
     }
 
     // > The responder MUST interface with the AS to ensure that the
     // > credential in the KeyPackage is valid.
-    validate_client_credential(initiator_key_package.signing_identity()).unwrap();
+    validate_client_credential(initiator_key_package.signing_identity())?;
 
     // > The responder then locally creates an MLS group and commits to an Add
     // > proposal containing the initiator's KeyPackage.  The responder sends
@@ -96,8 +100,7 @@ pub(crate) fn initial_key_agreement_responder_1(
         signing_identity,
         signer,
         cipher_suite,
-    )
-    .unwrap();
+    )?;
 
     let mut responder_group =
         responder.create_group(ExtensionList::default(), Default::default(), None)?;
@@ -110,7 +113,7 @@ pub(crate) fn initial_key_agreement_responder_1(
         .welcome_messages
         .into_iter()
         .next()
-        .unwrap(); // There's something to do here about commit options (yes that's the thing about ratchet tree (see at the end of this file))
+        .ok_or(TwoPartyError::MissingWelcome)?; // There's something to do here about commit options (yes that's the thing about ratchet tree (see at the end of this file))
     // commit options commitoptions
     let server_hello = ServerHello { welcome };
     // IMPLEMENTOR NOTE: when is the commit actually applied? I assume the server can do it right away, but it would be good to make it explicit.
@@ -123,7 +126,7 @@ pub(crate) fn initial_key_agreement_initiator_2(
     initiator: &Client<impl MlsConfig>,
     trust_anchors: &[TrustAnchor<'_>],
     server_hello: ServerHello,
-) -> Result<Group<impl MlsConfig>, MlsError> {
+) -> Result<Group<impl MlsConfig>, TwoPartyError> {
     // > The initiator uses the Welcome to create its local group state.
     let (initiator_group, _) = initiator.join_group(None, &server_hello.welcome, None)?;
 
@@ -147,8 +150,11 @@ pub(crate) fn initial_key_agreement_initiator_2(
     // their leaf index.  However, a leaf index is only valid for referring
     // to members in a given epoch.  The same leaf index may represent a
     // different member, or no member at all, in a subsequent epoch.
-    let responder_member = initiator_group.member_at_index(0).unwrap();
-    validate_server_credential(responder_member.signing_identity(), trust_anchors, None).unwrap();
+    let responder_member =
+        initiator_group
+            .member_at_index(0)
+            .ok_or(TwoPartyError::MissingMember)?;
+    validate_server_credential(responder_member.signing_identity(), trust_anchors, None)?;
 
     Ok(initiator_group)
 }
@@ -187,34 +193,27 @@ pub(crate) enum Role {
     Responder,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TwoPartyError {
-    Mls(MlsError),
+    #[error("MLS operation failed")]
+    Mls(#[from] MlsError),
+    #[error("credential validation failed")]
+    CredentialValidation(#[from] WebPkiIdentityError),
+    #[error("unsupported cipher suite: {0:?}")]
+    UnsupportedCipherSuite(CipherSuite),
+    #[error("expected a KeyPackage message")]
+    NotAKeyPackage,
+    #[error("commit produced no Welcome message")]
+    MissingWelcome,
+    #[error("no member found at the expected leaf index")]
+    MissingMember,
+    #[error("received EpochKeyUpdate while not waiting for one")]
     UnexpectedEpochKeyUpdate,
+    #[error("epoch mismatch: expected {expected}, got {got}")]
     EpochMismatch { expected: u64, got: u64 },
+    #[error("protocol invariant violated: {0}")]
+    InvalidState(&'static str),
 }
-
-impl From<MlsError> for TwoPartyError {
-    fn from(e: MlsError) -> Self {
-        TwoPartyError::Mls(e)
-    }
-}
-
-impl std::fmt::Display for TwoPartyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TwoPartyError::Mls(e) => write!(f, "{e}"),
-            TwoPartyError::UnexpectedEpochKeyUpdate => {
-                write!(f, "received EpochKeyUpdate while not waiting for one")
-            }
-            TwoPartyError::EpochMismatch { expected, got } => {
-                write!(f, "epoch mismatch: expected {expected}, got {got}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TwoPartyError {}
 
 pub(crate) struct Mls2Party {
     state: State,
@@ -239,7 +238,7 @@ impl Mls2Party {
     pub(crate) fn create_connection_update(
         &mut self,
         group: &mut Group<impl MlsConfig>,
-    ) -> Result<Option<ConnectionUpdate>, MlsError> {
+    ) -> Result<Option<ConnectionUpdate>, TwoPartyError> {
         // *  Each party may send a ConnectionUpdate if they are not currently
         //     waiting for an EpochKeyUpdate to confirm a previous
         //     ConnectionUpdate
@@ -265,7 +264,7 @@ impl Mls2Party {
         &mut self,
         group: &mut Group<impl MlsConfig>,
         connection_update: ConnectionUpdate,
-    ) -> Result<Option<EpochKeyUpdate>, MlsError> {
+    ) -> Result<Option<EpochKeyUpdate>, TwoPartyError> {
         // TODO: WIP — incomplete match expression
         // match connection_update.update.into_proposal_reference(&CipherSuite::CURVE25519_AES128)
         // dbg!(&connection_update.update);
@@ -326,10 +325,7 @@ impl Mls2Party {
                 // IMPLEMENTOR's note, unclear what we're meant to do here with the epoch number.
                 let expected = group.current_epoch() + 1;
                 if expected != epoch_key_update.epoch {
-                    return Err(TwoPartyError::EpochMismatch {
-                        expected,
-                        got: epoch_key_update.epoch,
-                    });
+                    return Err(TwoPartyError::EpochMismatch { expected, got: epoch_key_update.epoch });
                 }
                 group.apply_pending_commit()?;
                 self.state = NotWaiting;
@@ -361,25 +357,11 @@ impl Mls2Party {
 // - The responder creates it via commit_builder (CommitDirection::Send)
 // - The initiator joins via Welcome (never goes through filter_proposals)
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TwoPartyRulesError {
+    #[error("expected at most one update proposal and no other proposal types")]
     ExpectedOneUpdateProposal,
 }
-
-impl std::fmt::Display for TwoPartyRulesError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TwoPartyRulesError::ExpectedOneUpdateProposal => {
-                write!(
-                    f,
-                    "expected at most one update proposal and no other proposal types"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for TwoPartyRulesError {}
 
 impl IntoAnyError for TwoPartyRulesError {
     fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
@@ -491,9 +473,7 @@ impl Mls2Party {
                     commit: commit.commit_message,
                 })
             }
-            State::WaitingForResumptionResponse => {
-                panic!("Shouldn't happen send error")
-            }
+            State::WaitingForResumptionResponse => Err(TwoPartyError::InvalidState("cannot create a ResumptionRequest while waiting for a ResumptionResponse")),
         }
 
         // The initiator MUST then wait for a ResumptionResponse.
@@ -505,8 +485,7 @@ impl Mls2Party {
         resumption_request: ResumptionRequest,
     ) -> Result<Option<ResumptionResponse>, TwoPartyError> {
         if self.role != Role::Responder {
-            // TODO
-            panic!("This shouldn't happen let's use type to enforce this.")
+            return Err(TwoPartyError::InvalidState("handle_resumption_request called on a non-responder"));
         }
 
         match self.state {
@@ -521,12 +500,10 @@ impl Mls2Party {
                 //    the commit in the ResumptionRequest and create a commit with
                 //    UpdatPath to send back as part of a ResumptionResponse.
 
-                group
-                    .process_incoming_message(resumption_request.commit)
-                    .unwrap();
+                group.process_incoming_message(resumption_request.commit)?;
 
                 let commit = group.commit(vec![])?;
-                group.apply_pending_commit().unwrap();
+                group.apply_pending_commit()?;
 
                 // IMPLEMENTOR'S NOTE: TODO investigate more: What happens if the responder receives two resumption requests? Are we going to get out of sync.
 
@@ -549,13 +526,11 @@ impl Mls2Party {
                         group.clear_proposal_cache(); // TODO check if that's necessary
                         group.clear_pending_commit();
 
-                        group
-                            .process_incoming_message(resumption_request.commit)
-                            .unwrap();
-                        group.apply_pending_commit();
+                        group.process_incoming_message(resumption_request.commit)?;
+                        group.apply_pending_commit()?;
 
-                        let commit = group.commit(vec![]).unwrap();
-                        group.apply_pending_commit().unwrap();
+                        let commit = group.commit(vec![])?;
+                        group.apply_pending_commit()?;
 
                         self.state = State::NotWaiting;
 
@@ -572,7 +547,7 @@ impl Mls2Party {
         &mut self,
         group: &mut Group<impl MlsConfig>,
         resumption_response: ResumptionResponse,
-    ) -> Result<(), MlsError> {
+    ) -> Result<(), TwoPartyError> {
         if self.role == Role::Responder {
             unimplemented!("Shouldn't happen what sort of error should we do there?");
         }
