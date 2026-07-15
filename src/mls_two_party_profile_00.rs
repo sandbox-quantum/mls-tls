@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use mls_rs::{
-    CipherSuite, Client, ExtensionList, Group, MlsMessage,
+    CipherSuite, Client, CryptoProvider, ExtensionList, Group, MlsMessage,
     client_builder::MlsConfig,
     crypto::SignatureSecretKey,
     error::{IntoAnyError, MlsError},
@@ -17,9 +17,11 @@ use rustls_pki_types::TrustAnchor;
 
 use crate::{
     make_client,
-    mls_two_party_profile_00::State::{NotWaiting, WaitingForEpochKeyUpdate},
+    mls_tls::MlsTlsError,
+    mls_two_party_profile_00::State::{AwaitingEpochKeyUpdate, Synced},
     print_tree,
-    tree_printer::{self, print_tree_detailed},
+    tls_record::DirectionalRekey,
+    tree_printer,
     web_pki::{WebPkiIdentityError, validate_client_credential, validate_server_credential},
 };
 
@@ -182,9 +184,9 @@ pub(crate) struct EpochKeyUpdate {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum State {
-    WaitingForEpochKeyUpdate,
-    NotWaiting,
-    WaitingForResumptionResponse,
+    AwaitingEpochKeyUpdate,
+    Synced,
+    AwaitingResumptionResponse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +215,46 @@ pub enum TwoPartyError {
     EpochMismatch { expected: u64, got: u64 },
     #[error("protocol invariant violated: {0}")]
     InvalidState(&'static str),
+    #[error("traffic secret derivation failed")]
+    TrafficSecret(#[from] MlsTlsError),
+}
+
+// Derive the initiator's application traffic secret (client_application_traffic_secret) from the
+// group's current epoch, as the raw bytes carried in a `DirectionalRekey`.
+fn derive_initiator_secret<C: CryptoProvider + Clone>(
+    group: &Group<impl MlsConfig>,
+    crypto: &C,
+) -> Result<Vec<u8>, TwoPartyError> {
+    Ok(
+        crate::mls_tls::derive_client_application_traffic_secret(group, crypto.clone())?
+            .as_bytes()
+            .to_vec(),
+    )
+}
+
+// Derive the responder's application traffic secret (server_application_traffic_secret) from the
+// group's current epoch, as the raw bytes carried in a `DirectionalRekey`.
+fn derive_responder_secret<C: CryptoProvider + Clone>(
+    group: &Group<impl MlsConfig>,
+    crypto: &C,
+) -> Result<Vec<u8>, TwoPartyError> {
+    Ok(
+        crate::mls_tls::derive_server_application_traffic_secret(group, crypto.clone())?
+            .as_bytes()
+            .to_vec(),
+    )
+}
+
+// Both directions' traffic secrets from the group's current epoch (used when a party merges and
+// installs both send and receive keys at once).
+fn both_secrets<C: CryptoProvider + Clone>(
+    group: &Group<impl MlsConfig>,
+    crypto: &C,
+) -> Result<DirectionalRekey, TwoPartyError> {
+    Ok(DirectionalRekey::BothSecrets {
+        initiator: derive_initiator_secret(group, crypto)?,
+        responder: derive_responder_secret(group, crypto)?,
+    })
 }
 
 pub(crate) struct Mls2Party {
@@ -229,111 +271,186 @@ pub(crate) struct Mls2Party {
 impl Mls2Party {
     pub(crate) fn new(role: Role) -> Self {
         Self {
-            state: State::NotWaiting,
+            state: State::Synced,
             initial_role: role.clone(),
             role,
         }
     }
 
-    pub(crate) fn create_connection_update(
+    // Returns the ConnectionUpdate to send plus, for the initiator, the directional rekey to install
+    // *after* that ConnectionUpdate has been emitted under the old key (emit-before-switch).
+    pub(crate) fn create_connection_update<C: CryptoProvider + Clone>(
         &mut self,
         group: &mut Group<impl MlsConfig>,
-    ) -> Result<Option<ConnectionUpdate>, TwoPartyError> {
+        crypto: &C,
+    ) -> Result<Option<(ConnectionUpdate, Option<DirectionalRekey>)>, TwoPartyError> {
         // *  Each party may send a ConnectionUpdate if they are not currently
         //     waiting for an EpochKeyUpdate to confirm a previous
         //     ConnectionUpdate
 
         // IMPLEMENTOR'S NOTE: the draft doesn't define what goes in the ConnectionUpdate commit message and how you generate it.
         match self.state {
-            State::WaitingForEpochKeyUpdate => Ok(None),
-            State::NotWaiting => {
+            State::AwaitingEpochKeyUpdate => Ok(None),
+            State::Synced => {
                 group.propose_update(vec![])?; // Note: this is automatically added when `path_required` is set as a commit options when
                 // creating the group. We add it to be explicit.
                 let commit = group.commit(vec![])?;
-                self.state = WaitingForEpochKeyUpdate;
-
-                Ok(Some(ConnectionUpdate {
+                let connection_update = ConnectionUpdate {
                     update: commit.commit_message,
-                }))
+                };
+
+                let rekey = match self.role {
+                    // The initiator has priority and never rolls back: merge the commit immediately
+                    // and install the new SEND key now. The ConnectionUpdate above is emitted (by
+                    // the driver) under the OLD send key first, so the peer can still read it. The
+                    // RECEIVE key stays on the old epoch until the confirming EpochKeyUpdate arrives.
+                    Role::Initiator => {
+                        group.apply_pending_commit()?;
+                        Some(DirectionalRekey::InitiatorSecret(derive_initiator_secret(
+                            group, crypto,
+                        )?))
+                    }
+                    // The responder defers: hold the commit pending (do not merge) and rotate
+                    // nothing. It merges and installs both directions only when the initiator's
+                    // EpochKeyUpdate confirms the switch (see `handle_epoch_key_update`).
+                    Role::Responder => None,
+                };
+
+                self.state = State::AwaitingEpochKeyUpdate;
+                Ok(Some((connection_update, rekey)))
             }
-            State::WaitingForResumptionResponse => todo!(),
+            State::AwaitingResumptionResponse => todo!(),
         }
     }
 
-    pub(crate) fn handle_connection_update(
+    // Returns the directional rekey to install and the EpochKeyUpdate to send back. Per
+    // emit-before-switch, the driver sends the EpochKeyUpdate under the OLD key first, then applies
+    // the rekey.
+    pub(crate) fn handle_connection_update<C: CryptoProvider + Clone>(
         &mut self,
         group: &mut Group<impl MlsConfig>,
+        crypto: &C,
         connection_update: ConnectionUpdate,
-    ) -> Result<Option<EpochKeyUpdate>, TwoPartyError> {
-        // TODO: WIP — incomplete match expression
-        // match connection_update.update.into_proposal_reference(&CipherSuite::CURVE25519_AES128)
-        // dbg!(&connection_update.update);
+    ) -> Result<(Option<DirectionalRekey>, Option<EpochKeyUpdate>), TwoPartyError> {
         match (&self.state, &self.role) {
-            //
             // *  If either party receives a ConnectionUpdate and they're not
             //     currently waiting for an EpochKeyUpdate, they MUST validate and
             //     apply the commit and respond with an EpochKeyUpdate, where epoch
-            //     is the group's new epoch
-            (State::NotWaiting, _) => {
+            //     is the group's new epoch.
+            //
+            // The responder is receiving an initiator-initiated update. The initiator already
+            // rotated its send direction before sending, so it is safe to merge and install BOTH
+            // directions now. (2-message flow: this single EpochKeyUpdate confirms the switch.)
+            (State::Synced, Role::Responder) => {
                 group.process_incoming_message(connection_update.update)?;
-
-                Ok(Some(EpochKeyUpdate {
+                let rekey = both_secrets(group, crypto)?;
+                let epoch_key_update = EpochKeyUpdate {
                     epoch: group.current_epoch(),
-                }))
+                };
+                Ok((Some(rekey), Some(epoch_key_update)))
+            }
+            // The initiator is receiving a responder-initiated update. Merge and install our SEND
+            // key now; the EpochKeyUpdate we return (emitted under the old key first) gates the
+            // responder's receive direction. Our own RECEIVE key waits for the responder's return
+            // EpochKeyUpdate (see `handle_epoch_key_update`, initiator arm). This is the middle
+            // message of the 3-message responder-initiated flow.
+            (State::Synced, Role::Initiator) => {
+                group.process_incoming_message(connection_update.update)?;
+                let rekey = DirectionalRekey::InitiatorSecret(derive_initiator_secret(group, crypto)?);
+                let epoch_key_update = EpochKeyUpdate {
+                    epoch: group.current_epoch(),
+                };
+                self.state = State::AwaitingEpochKeyUpdate;
+                Ok((Some(rekey), Some(epoch_key_update)))
             }
             // *  If the initiator receives a ConnectionUpdate while waiting for an
             //     EpochKeyUpdate, it MUST ignore the ConnectionUpdate and resume
-            //     waiting
-            (State::WaitingForEpochKeyUpdate, Role::Initiator) => Ok(None),
-            (State::WaitingForEpochKeyUpdate, Role::Responder) => {
-                // *  If the responder receives a ConnectionUpdate while waiting for an
-                //     EpochKeyUpdate, it MUST drop its locally pending commit and
-                //     validate and apply the commit as if it hadn't been waiting for an
-                //     EpochKeyUpdate
-
+            //     waiting (our own update wins).
+            (State::AwaitingEpochKeyUpdate, Role::Initiator) => Ok((None, None)),
+            // *  If the responder receives a ConnectionUpdate while waiting for an
+            //     EpochKeyUpdate, it MUST drop its locally pending commit and validate and apply
+            //     the incoming commit as if it hadn't been waiting.
+            //
+            // Simultaneous-update collision: the responder deferred (never rotated eagerly), so it
+            // just drops its pending commit, applies the initiator's, and installs BOTH directions.
+            // NOTE: this collision path is preserved for correctness of the clean flows but is not
+            // exhaustively hardened/tested (see plan).
+            (State::AwaitingEpochKeyUpdate, Role::Responder) => {
                 group.clear_pending_commit();
-                group.clear_proposal_cache(); // TODO I think this is unnecessary. To chec
+                group.clear_proposal_cache();
 
                 // Checks are implemented as part of the `TwoPartyMlsRules` MlsRules implementation
-                let _received = group.process_incoming_message(connection_update.update)?; // TODO what happens if it errors here? Means that the we dropped a commit unnecessarily. Is this a problem or does it just mean that the other member is misbehaving so all bets are off anyway? Do we stop the conneciton in this case anyway?
+                group.process_incoming_message(connection_update.update)?;
 
-                group.commit(vec![])?;
-                group.apply_pending_commit()?;
-
-                self.state = State::NotWaiting;
-
-                Ok(Some(EpochKeyUpdate {
+                let rekey = both_secrets(group, crypto)?;
+                let epoch_key_update = EpochKeyUpdate {
                     epoch: group.current_epoch(),
-                }))
+                };
+                self.state = State::Synced;
+                Ok((Some(rekey), Some(epoch_key_update)))
             }
-            (State::WaitingForResumptionResponse, _) => {
-                todo!() // TODO claude return err or ignore... // IMPLEMENTOR'S NOTE: This is actually not defined 
+            (State::AwaitingResumptionResponse, _) => {
+                todo!() // TODO claude return err or ignore... // IMPLEMENTOR'S NOTE: This is actually not defined
             }
         }
-
-        // *  A party receiving a ConnectionUpdate MUST start using the key
-        //     material of the new epoch after sending the EpochKeyUpdate
     }
 
-    pub(crate) fn handle_epoch_key_update(
+    // Returns the directional rekey to install and, for the responder-initiated flow, a second
+    // ("return") EpochKeyUpdate to send. Emit-before-switch: the driver sends any returned
+    // EpochKeyUpdate under the OLD key first, then applies the rekey.
+    pub(crate) fn handle_epoch_key_update<C: CryptoProvider + Clone>(
         &mut self,
         group: &mut Group<impl MlsConfig>,
+        crypto: &C,
         epoch_key_update: EpochKeyUpdate,
-    ) -> Result<(), TwoPartyError> {
-        match &self.state {
-            WaitingForEpochKeyUpdate => {
-                // IMPLEMENTOR's note, unclear what we're meant to do here with the epoch number.
+    ) -> Result<(Option<DirectionalRekey>, Option<EpochKeyUpdate>), TwoPartyError> {
+        match (&self.state, &self.role) {
+            // Covers BOTH the initiator-initiated confirmation and the responder-initiated return
+            // EpochKeyUpdate — identical behaviour. The initiator already merged (eagerly, at
+            // create/handle time), so validate by epoch *equality* and now install the RECEIVE key,
+            // discarding the old one. No message is sent back.
+            (State::AwaitingEpochKeyUpdate, Role::Initiator) => {
+                let expected = group.current_epoch();
+                if expected != epoch_key_update.epoch {
+                    return Err(TwoPartyError::EpochMismatch {
+                        expected,
+                        got: epoch_key_update.epoch,
+                    });
+                }
+                let rekey = DirectionalRekey::ResponderSecret(derive_responder_secret(group, crypto)?);
+                self.state = State::Synced;
+                Ok((Some(rekey), None))
+            }
+            // Responder-initiated flow: we held our commit pending. This EpochKeyUpdate confirms the
+            // initiator rotated its send direction, so merge now, install BOTH directions, and send a
+            // second ("return") EpochKeyUpdate so the initiator can rotate its receive key. Our
+            // pending commit is unmerged, so the group is still one epoch behind — validate by
+            // `current + 1`.
+            //
+            // IMPLEMENTOR'S NOTE: this second EpochKeyUpdate is a deliberate deviation from the
+            // drafts. draft-kohbrok-mls-two-party-profile-00 §4 defines a single EpochKeyUpdate per
+            // ConnectionUpdate; here a responder-initiated rotation is a 3-message flow
+            // (ConnectionUpdate -> EpochKeyUpdate -> EpochKeyUpdate) so each transport direction is
+            // gated independently and no in-flight receive key is discarded before the peer confirms.
+            (State::AwaitingEpochKeyUpdate, Role::Responder) => {
                 let expected = group.current_epoch() + 1;
                 if expected != epoch_key_update.epoch {
-                    return Err(TwoPartyError::EpochMismatch { expected, got: epoch_key_update.epoch });
+                    return Err(TwoPartyError::EpochMismatch {
+                        expected,
+                        got: epoch_key_update.epoch,
+                    });
                 }
                 group.apply_pending_commit()?;
-                self.state = NotWaiting;
-                Ok(())
+                let rekey = both_secrets(group, crypto)?;
+                let return_epoch_key_update = EpochKeyUpdate {
+                    epoch: group.current_epoch(),
+                };
+                self.state = State::Synced;
+                Ok((Some(rekey), Some(return_epoch_key_update)))
             }
-            State::NotWaiting => Err(TwoPartyError::UnexpectedEpochKeyUpdate),
-            State::WaitingForResumptionResponse => {
-                todo!() // IMPLEMENTOR'S NOTE: this is actually not defined in the draft spec. 
+            (State::Synced, _) => Err(TwoPartyError::UnexpectedEpochKeyUpdate),
+            (State::AwaitingResumptionResponse, _) => {
+                todo!() // IMPLEMENTOR'S NOTE: this is actually not defined in the draft spec.
             }
         }
     }
@@ -459,21 +576,21 @@ impl Mls2Party {
             // If the initiator was waiting for an EpochKeyUpdate while the connection was
             // interrupted, it MUST include the commit from the last
             // ConnectionUpdate in the Resumption message.
-            State::WaitingForEpochKeyUpdate => {
+            State::AwaitingEpochKeyUpdate => {
                 // TODO
                 todo!()
             }
-            State::NotWaiting => {
+            State::Synced => {
                 group.propose_update(vec![])?; // TODO: I think that's unnecessary to rotate the HPKE
                 let commit = group.commit(vec![])?;
 
-                self.state = State::WaitingForResumptionResponse;
+                self.state = State::AwaitingResumptionResponse;
                 self.role = Role::Initiator; // Check when that state must change then.
                 Ok(ResumptionRequest {
                     commit: commit.commit_message,
                 })
             }
-            State::WaitingForResumptionResponse => Err(TwoPartyError::InvalidState("cannot create a ResumptionRequest while waiting for a ResumptionResponse")),
+            State::AwaitingResumptionResponse => Err(TwoPartyError::InvalidState("cannot create a ResumptionRequest while waiting for a ResumptionResponse")),
         }
 
         // The initiator MUST then wait for a ResumptionResponse.
@@ -489,8 +606,8 @@ impl Mls2Party {
         }
 
         match self.state {
-            WaitingForEpochKeyUpdate => todo!(), // IMPLEMENTOR'S NOTE: note define what happens where
-            NotWaiting => {
+            AwaitingEpochKeyUpdate => todo!(), // IMPLEMENTOR'S NOTE: note define what happens where
+            Synced => {
                 group.clear_pending_commit();
                 group.clear_proposal_cache(); // TODO I think this is unnecessary. To check
 
@@ -511,7 +628,7 @@ impl Mls2Party {
                     commit: commit.commit_message,
                 }))
             }
-            State::WaitingForResumptionResponse => {
+            State::AwaitingResumptionResponse => {
                 //    If one of the parties receives a ResumptionRequest while waiting for
                 //    a ResumptionResponse, their reaction depends whether they were the
                 //    initial initiator or responder when the connection was first
@@ -532,7 +649,7 @@ impl Mls2Party {
                         let commit = group.commit(vec![])?;
                         group.apply_pending_commit()?;
 
-                        self.state = State::NotWaiting;
+                        self.state = State::Synced;
 
                         Ok(Some(ResumptionResponse {
                             commit: commit.commit_message,
@@ -553,16 +670,16 @@ impl Mls2Party {
         }
 
         match self.state {
-            WaitingForEpochKeyUpdate => {
+            AwaitingEpochKeyUpdate => {
                 unimplemented!("What should we do there?")
             }
-            NotWaiting => {
+            Synced => {
                 unimplemented!("What should do there?")
             }
-            State::WaitingForResumptionResponse => {
+            State::AwaitingResumptionResponse => {
                 group.apply_pending_commit()?;
                 group.process_incoming_message(resumption_response.commit)?;
-                self.state = State::NotWaiting;
+                self.state = State::Synced;
                 Ok(())
             }
         }

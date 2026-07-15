@@ -203,9 +203,36 @@ fn hkdf_expand_label<const N: usize>(
     okm
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Client,
     Server,
+}
+
+// Directional record-layer key rotation.
+//
+// A rekey may replace just one transport direction, or both. Each variant carries the raw
+// application traffic secret(s) exported from the MLS group; the record layer expands them into the
+// per-direction key/IV (RFC 8446 §7.3) and installs them via `RecordLayer::apply_rekey`.
+//
+// Which direction a variant rotates depends on the local `Role` (initiator = Client,
+// responder = Server):
+//
+// | variant          | Client (initiator)          | Server (responder)          |
+// |------------------|-----------------------------|-----------------------------|
+// | InitiatorSecret  | send                        | recv                        |
+// | ResponderSecret  | recv                        | send                        |
+// | BothSecrets      | send=initiator, recv=resp.  | send=resp., recv=initiator  |
+//
+// `InitiatorSecret` carries the `client_application_traffic_secret` (initiator→responder direction);
+// `ResponderSecret` carries the `server_application_traffic_secret` (responder→initiator direction).
+// Installing a direction drops that direction's previous cipher (and its key material) and resets
+// that direction's sequence number to 0 (RFC 8446 §5.3: sequence numbers reset whenever the key
+// changes).
+pub enum DirectionalRekey {
+    InitiatorSecret(Vec<u8>),
+    ResponderSecret(Vec<u8>),
+    BothSecrets { initiator: Vec<u8>, responder: Vec<u8> },
 }
 
 pub trait MessageEncrypter: Send + Sync {
@@ -425,14 +452,19 @@ impl MessageDecrypter for Tls13Aes128GcmDecrypter {
 // ---------------------------------------------------------------------------
 
 // IMPLEMENTOR'S NOTE (draft-kohbrok-mls-two-party-profile-00 §4): Neither draft specifies
-// whether sequence numbers reset to 0 on epoch change. We follow RFC 8446 §4.6.3: new traffic
-// keys = sequence number resets to 0.
+// whether sequence numbers reset to 0 on epoch change. We follow RFC 8446 §5.3: new traffic
+// keys = sequence number resets to 0. Because the send and receive directions rotate
+// independently here (see `apply_rekey`), each direction's sequence number resets on its own
+// rotation, not both at once.
 //
 // IMPLEMENTOR'S NOTE (draft-kohbrok-mls-two-party-profile-00 §4): "A party sending a
 // ConnectionUpdate MUST wait until they receive the corresponding EpochKeyUpdate before they
-// start using the key material of the new epoch." The draft says when to *use* new keys but not
-// when to *derive* them. We derive immediately on epoch change but defer usage until
-// EpochKeyUpdate is received.
+// start using the key material of the new epoch." The record layer holds the two transport
+// directions as independent halves (`encrypter`/`decrypter`) so rotation is *directional and
+// staggered*: the send direction may rotate eagerly (the ConnectionUpdate/EpochKeyUpdate that
+// gates the peer's receive direction is emitted under the old key first), while the receive
+// direction rotates last, gated by the EpochKeyUpdate. Only when a direction rotates is its old
+// key discarded — so an old-epoch record still in flight is never dropped.
 pub struct RecordLayer {
     encrypter: Box<dyn MessageEncrypter>,
     decrypter: Box<dyn MessageDecrypter>,
@@ -477,6 +509,57 @@ impl RecordLayer {
             Box::new(Tls13Aes128GcmEncrypter::new(&write_key, write_iv)),
             Box::new(Tls13Aes128GcmDecrypter::new(&read_key, read_iv)),
         )
+    }
+
+    // Rotate one or both transport directions from a freshly-exported traffic secret. See
+    // `DirectionalRekey` for the (variant, role) → direction mapping.
+    //
+    // Installing a direction replaces its cipher — the old `Box<dyn MessageEncrypter/Decrypter>`
+    // (and the AES key it owns) is dropped here — and resets that direction's sequence number to 0.
+    // The receive direction is only ever rotated once the peer has confirmed (via ConnectionUpdate
+    // /EpochKeyUpdate) that it switched its matching send direction, so an in-flight old-epoch
+    // record is never dropped.
+    pub fn apply_rekey(&mut self, update: DirectionalRekey, role: Role) {
+        match update {
+            DirectionalRekey::InitiatorSecret(secret) => match role {
+                Role::Client => self.install_send(&secret),
+                Role::Server => self.install_recv(&secret),
+            },
+            DirectionalRekey::ResponderSecret(secret) => match role {
+                Role::Client => self.install_recv(&secret),
+                Role::Server => self.install_send(&secret),
+            },
+            DirectionalRekey::BothSecrets { initiator, responder } => match role {
+                Role::Client => {
+                    self.install_send(&initiator);
+                    self.install_recv(&responder);
+                }
+                Role::Server => {
+                    self.install_send(&responder);
+                    self.install_recv(&initiator);
+                }
+            },
+        }
+    }
+
+    // RFC 8446 §7.3 — derive the send key/IV from a traffic secret and swap in a fresh encrypter,
+    // dropping the previous one. RFC 8446 §5.3 — reset the write sequence number on key change.
+    fn install_send(&mut self, secret: &[u8]) {
+        let expander = HkdfExpanderSha256::from_prk(secret);
+        let key: [u8; 16] = hkdf_expand_label(&expander, b"key", b"");
+        let iv: [u8; 12] = hkdf_expand_label(&expander, b"iv", b"");
+        self.encrypter = Box::new(Tls13Aes128GcmEncrypter::new(&key, iv));
+        self.write_seq = 0;
+    }
+
+    // RFC 8446 §7.3 — derive the receive key/IV from a traffic secret and swap in a fresh
+    // decrypter, dropping the previous one. RFC 8446 §5.3 — reset the read sequence number.
+    fn install_recv(&mut self, secret: &[u8]) {
+        let expander = HkdfExpanderSha256::from_prk(secret);
+        let key: [u8; 16] = hkdf_expand_label(&expander, b"key", b"");
+        let iv: [u8; 12] = hkdf_expand_label(&expander, b"iv", b"");
+        self.decrypter = Box::new(Tls13Aes128GcmDecrypter::new(&key, iv));
+        self.read_seq = 0;
     }
 
     // RFC 8446 §5.1:

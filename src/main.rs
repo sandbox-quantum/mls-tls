@@ -189,39 +189,44 @@ fn run() -> Result<(), Box<dyn Error>> {
         String::from_utf8_lossy(&plaintext.fragment)
     );
 
+    // Directional, staggered rekey (initiator-initiated). The record layers are rotated one
+    // direction at a time via `apply_rekey` instead of being rebuilt wholesale, so an in-flight
+    // old-epoch record is never dropped. Ordering follows emit-before-switch: each control message
+    // is handed to the peer under the OLD key first, then the sender installs its new key.
+    let crypto = RustCryptoProvider::new();
+
     let mut client_mls_2_party =
         mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Initiator);
-    let connection_update = client_mls_2_party
-        .create_connection_update(&mut client_group)
-        .unwrap()
-        .unwrap();
-
     let mut server_mls_2_party =
         mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Responder);
-    let epoch_key_update = server_mls_2_party
-        .handle_connection_update(&mut server_group, connection_update)
+
+    // Initiator: create + merge the commit, emit the ConnectionUpdate, then install its send key.
+    let (connection_update, client_rekey) = client_mls_2_party
+        .create_connection_update(&mut client_group, &crypto)
         .unwrap()
         .unwrap();
-    // start using new key material
+    if let Some(rekey) = client_rekey {
+        client_record_layer.apply_rekey(rekey, tls_record::Role::Client);
+    }
 
-    server_record_layer = create_record_layer(
-        &server_group,
-        tls_record::Role::Server,
-        RustCryptoProvider::new(),
-    );
-
-    client_mls_2_party
-        .handle_epoch_key_update(&mut client_group, epoch_key_update)
+    // Responder: merge + install both directions, emit the EpochKeyUpdate (under the old key first).
+    let (server_rekey, epoch_key_update) = server_mls_2_party
+        .handle_connection_update(&mut server_group, &crypto, connection_update)
         .unwrap();
-    // start using new key material
+    let epoch_key_update = epoch_key_update.expect("responder confirms with an EpochKeyUpdate");
+    if let Some(rekey) = server_rekey {
+        server_record_layer.apply_rekey(rekey, tls_record::Role::Server);
+    }
+
+    // Initiator: the confirming EpochKeyUpdate lets it finally install its receive key.
+    let (client_rekey, _no_return) = client_mls_2_party
+        .handle_epoch_key_update(&mut client_group, &crypto, epoch_key_update)
+        .unwrap();
+    if let Some(rekey) = client_rekey {
+        client_record_layer.apply_rekey(rekey, tls_record::Role::Client);
+    }
 
     tree_printer::print_tree_detailed(&client_group);
-
-    client_record_layer = create_record_layer(
-        &client_group,
-        tls_record::Role::Client,
-        RustCryptoProvider::new(),
-    );
 
     let records = server_record_layer
         .encrypt(
@@ -373,6 +378,283 @@ mod tests {
                 .unwrap()
                 .to_owned(),
         ]
+    }
+
+    // ----------------------------------------------------------------------
+    // Directional / staggered rekey tests
+    //
+    // These drive a full in-process duplex exchange and interleave application data with a rekey in
+    // both directions. The concrete `Group`/`Client` types produced by the handshake are
+    // unnameable (`impl MlsConfig`), so the connection setup is a macro that binds the pieces in the
+    // caller's scope rather than a helper returning them.
+    // ----------------------------------------------------------------------
+
+    macro_rules! establish_connection {
+        (
+            $crypto:ident,
+            $client_group:ident,
+            $server_group:ident,
+            $client_mls:ident,
+            $server_mls:ident,
+            $client_layer:ident,
+            $server_layer:ident
+        ) => {
+            let (ca, server_cert, server_key) = generate_ca_and_server_cert();
+            let trust_anchors = custom_trust_anchors(&ca);
+
+            let (responder_secret, responder_public) = ed25519_keypair_from_rcgen(&server_key);
+            let chain =
+                CertificateChain::from(vec![DerCertificate::new(server_cert.der().to_vec())]);
+            let responder_signing_identity =
+                SigningIdentity::new(chain.into_credential(), responder_public);
+
+            let cs = CipherSuite::CURVE25519_AES128;
+            let (initiator_secret, initiator_public) = RustCryptoProvider::default()
+                .cipher_suite_provider(cs)
+                .unwrap()
+                .signature_key_generate()
+                .unwrap();
+            let initiator_signing_identity = SigningIdentity::new(
+                BasicCredential::new(b"initiator".to_vec()).into_credential(),
+                initiator_public,
+            );
+
+            let initiator = make_client(
+                RustCryptoProvider::default(),
+                initiator_signing_identity,
+                initiator_secret,
+                cs,
+            )
+            .unwrap();
+
+            let client_hello =
+                mls_two_party_profile_00::initial_key_agreement_initiator_1(&initiator).unwrap();
+            let (server_hello, _server_client, mut $server_group) =
+                mls_two_party_profile_00::initial_key_agreement_responder_1(
+                    client_hello,
+                    responder_signing_identity,
+                    responder_secret,
+                    cs,
+                )
+                .unwrap();
+            let mut $client_group = mls_two_party_profile_00::initial_key_agreement_initiator_2(
+                &initiator,
+                &trust_anchors,
+                server_hello,
+            )
+            .unwrap();
+
+            let $crypto = RustCryptoProvider::new();
+            let mut $client_layer = create_record_layer(
+                &$client_group,
+                tls_record::Role::Client,
+                RustCryptoProvider::new(),
+            );
+            let mut $server_layer = create_record_layer(
+                &$server_group,
+                tls_record::Role::Server,
+                RustCryptoProvider::new(),
+            );
+            let mut $client_mls =
+                mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Initiator);
+            let mut $server_mls =
+                mls_two_party_profile_00::Mls2Party::new(mls_two_party_profile_00::Role::Responder);
+        };
+    }
+
+    // Encrypt one application record under the layer's current send key.
+    fn app(layer: &mut tls_record::RecordLayer, msg: &[u8]) -> Vec<u8> {
+        layer
+            .encrypt(tls_record::ContentType::ApplicationData, msg)
+            .unwrap()
+            .remove(0)
+    }
+
+    // Encrypt at `sender`, decrypt at `receiver`, assert the plaintext round-trips.
+    fn send_expect(
+        sender: &mut tls_record::RecordLayer,
+        receiver: &mut tls_record::RecordLayer,
+        msg: &[u8],
+    ) {
+        let record = app(sender, msg);
+        let plaintext = receiver.decrypt(&record).unwrap();
+        assert_eq!(plaintext.fragment, msg);
+    }
+
+    fn apply_opt(
+        layer: &mut tls_record::RecordLayer,
+        rekey: Option<tls_record::DirectionalRekey>,
+        role: tls_record::Role,
+    ) {
+        if let Some(rekey) = rekey {
+            layer.apply_rekey(rekey, role);
+        }
+    }
+
+    // Initiator-initiated rekey (2-message flow: ConnectionUpdate -> EpochKeyUpdate).
+    // Asserts: exactly 1 EpochKeyUpdate; in-flight old-key records still decrypt in both
+    // directions; old keys are dropped once each direction rotates; fresh traffic works after.
+    #[test]
+    fn test_initiator_initiated_rekey_is_staggered() {
+        establish_connection!(
+            crypto,
+            client_group,
+            server_group,
+            client_mls,
+            server_mls,
+            client_layer,
+            server_layer
+        );
+
+        // Pre-rekey traffic in both directions.
+        send_expect(&mut client_layer, &mut server_layer, b"c2s pre");
+        send_expect(&mut server_layer, &mut client_layer, b"s2c pre");
+
+        // Capture old-key records BEFORE any rotation: one to deliver while the peer still holds the
+        // old receive key (must decrypt) and one to deliver after it rotates (must fail).
+        let old_c2s_inflight = app(&mut client_layer, b"c2s in-flight (old)");
+        let old_c2s_after = app(&mut client_layer, b"c2s after switch (old)");
+        let old_s2c_inflight = app(&mut server_layer, b"s2c in-flight (old)");
+        let old_s2c_after = app(&mut server_layer, b"s2c after switch (old)");
+
+        let mut epoch_key_updates = 0;
+
+        // Initiator sends a ConnectionUpdate and installs its send key (emit-before-switch).
+        let (connection_update, client_rekey) = client_mls
+            .create_connection_update(&mut client_group, &crypto)
+            .unwrap()
+            .unwrap();
+        apply_opt(&mut client_layer, client_rekey, tls_record::Role::Client);
+
+        // The initiator's old client->server record is still in flight; the responder has NOT yet
+        // rotated its receive key, so it must still decrypt.
+        assert_eq!(
+            server_layer.decrypt(&old_c2s_inflight).unwrap().fragment,
+            b"c2s in-flight (old)"
+        );
+
+        // Responder merges, installs both directions, and confirms with a single EpochKeyUpdate.
+        let (server_rekey, epoch_key_update) = server_mls
+            .handle_connection_update(&mut server_group, &crypto, connection_update)
+            .unwrap();
+        if epoch_key_update.is_some() {
+            epoch_key_updates += 1;
+        }
+        let epoch_key_update = epoch_key_update.unwrap();
+        apply_opt(&mut server_layer, server_rekey, tls_record::Role::Server);
+
+        // Responder has now rotated its client->server receive key: the old-key record is dropped.
+        assert!(server_layer.decrypt(&old_c2s_after).is_err());
+
+        // The responder switched its send key, but the initiator has not yet rotated its receive
+        // key, so an old server->client record still in flight must decrypt.
+        assert_eq!(
+            client_layer.decrypt(&old_s2c_inflight).unwrap().fragment,
+            b"s2c in-flight (old)"
+        );
+
+        // Confirming EpochKeyUpdate lets the initiator install its receive key.
+        let (client_rekey, no_return) = client_mls
+            .handle_epoch_key_update(&mut client_group, &crypto, epoch_key_update)
+            .unwrap();
+        assert!(no_return.is_none());
+        apply_opt(&mut client_layer, client_rekey, tls_record::Role::Client);
+
+        // Initiator has now rotated its server->client receive key: the old-key record is dropped.
+        assert!(client_layer.decrypt(&old_s2c_after).is_err());
+
+        // Fresh traffic under the new epoch works in both directions.
+        send_expect(&mut client_layer, &mut server_layer, b"c2s post");
+        send_expect(&mut server_layer, &mut client_layer, b"s2c post");
+
+        assert_eq!(epoch_key_updates, 1, "initiator-initiated rekey = 1 EpochKeyUpdate");
+    }
+
+    // Responder-initiated rekey (3-message flow: ConnectionUpdate -> EpochKeyUpdate ->
+    // EpochKeyUpdate). Asserts: exactly 2 EpochKeyUpdates; in-flight old-key records still decrypt
+    // in both directions; old keys dropped after rotation; fresh traffic works after.
+    #[test]
+    fn test_responder_initiated_rekey_is_staggered() {
+        establish_connection!(
+            crypto,
+            client_group,
+            server_group,
+            client_mls,
+            server_mls,
+            client_layer,
+            server_layer
+        );
+
+        send_expect(&mut client_layer, &mut server_layer, b"c2s pre");
+        send_expect(&mut server_layer, &mut client_layer, b"s2c pre");
+
+        let old_c2s_inflight = app(&mut client_layer, b"c2s in-flight (old)");
+        let old_c2s_after = app(&mut client_layer, b"c2s after switch (old)");
+        let old_s2c_inflight = app(&mut server_layer, b"s2c in-flight (old)");
+        let old_s2c_after = app(&mut server_layer, b"s2c after switch (old)");
+
+        let mut epoch_key_updates = 0;
+
+        // Responder sends a ConnectionUpdate but holds its commit pending and rotates nothing.
+        let (connection_update, server_rekey) = server_mls
+            .create_connection_update(&mut server_group, &crypto)
+            .unwrap()
+            .unwrap();
+        assert!(server_rekey.is_none(), "responder rotates nothing when initiating");
+        apply_opt(&mut server_layer, server_rekey, tls_record::Role::Server);
+
+        // Initiator merges, installs its send key, and replies with the first EpochKeyUpdate.
+        let (client_rekey, epoch_key_update_1) = client_mls
+            .handle_connection_update(&mut client_group, &crypto, connection_update)
+            .unwrap();
+        if epoch_key_update_1.is_some() {
+            epoch_key_updates += 1;
+        }
+        let epoch_key_update_1 = epoch_key_update_1.unwrap();
+        apply_opt(&mut client_layer, client_rekey, tls_record::Role::Client);
+
+        // Initiator's old client->server record still in flight; responder has not rotated its
+        // receive key yet, so it must decrypt.
+        assert_eq!(
+            server_layer.decrypt(&old_c2s_inflight).unwrap().fragment,
+            b"c2s in-flight (old)"
+        );
+
+        // Responder merges, installs both directions, and sends the second ("return")
+        // EpochKeyUpdate.
+        let (server_rekey, epoch_key_update_2) = server_mls
+            .handle_epoch_key_update(&mut server_group, &crypto, epoch_key_update_1)
+            .unwrap();
+        if epoch_key_update_2.is_some() {
+            epoch_key_updates += 1;
+        }
+        let epoch_key_update_2 = epoch_key_update_2.unwrap();
+        apply_opt(&mut server_layer, server_rekey, tls_record::Role::Server);
+
+        // Responder rotated its client->server receive key: old-key record is dropped.
+        assert!(server_layer.decrypt(&old_c2s_after).is_err());
+
+        // Responder switched its send key; the initiator has not rotated its receive key yet, so the
+        // old server->client record still in flight must decrypt.
+        assert_eq!(
+            client_layer.decrypt(&old_s2c_inflight).unwrap().fragment,
+            b"s2c in-flight (old)"
+        );
+
+        // Return EpochKeyUpdate lets the initiator finally install its receive key.
+        let (client_rekey, no_return) = client_mls
+            .handle_epoch_key_update(&mut client_group, &crypto, epoch_key_update_2)
+            .unwrap();
+        assert!(no_return.is_none());
+        apply_opt(&mut client_layer, client_rekey, tls_record::Role::Client);
+
+        // Initiator rotated its server->client receive key: old-key record is dropped.
+        assert!(client_layer.decrypt(&old_s2c_after).is_err());
+
+        send_expect(&mut client_layer, &mut server_layer, b"c2s post");
+        send_expect(&mut server_layer, &mut client_layer, b"s2c post");
+
+        assert_eq!(epoch_key_updates, 2, "responder-initiated rekey = 2 EpochKeyUpdates");
     }
 
     #[test]
