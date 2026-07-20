@@ -89,13 +89,16 @@ pub(crate) fn create_record_layer(
         mls_tls::derive_server_application_traffic_secret(mls_group, crypto).unwrap();
 
     let params = tls_record::SuiteParams::for_cipher_suite(mls_group.cipher_suite().into());
-    let epoch_one = mls_group.current_epoch() == 1;
+    // Only ever called to build a *fresh* codec — at the initial handshake and at resumption (both
+    // over a new transport) — so it always uses the epoch-1 `<c|s> ap traffic` context (the 64-zero
+    // handshake-hash placeholder). Per-epoch rekeys on a live transport go through
+    // `RecordLayer::apply_rekey`, which uses the empty context.
     tls_record::RecordLayer::from_traffic_secrets(
         params,
         client_ts.as_bytes(),
         server_ts.as_bytes(),
         role,
-        epoch_one,
+        true,
     )
 }
 
@@ -187,5 +190,54 @@ mod tests {
         // Traffic still flows across the new epoch, both directions.
         assert_eq!(send(&mut client, &mut server, b"post c2s"), b"post c2s");
         assert_eq!(send(&mut server, &mut client, b"post s2c"), b"post s2c");
+    }
+
+    #[test]
+    fn loopback_cross_connection_resumption() {
+        use crate::client::ClientConfig;
+        use crate::server::ServerConfig;
+
+        // Reuse the same configs across both connections so their (Arc-backed) session storage is
+        // shared and the persisted group can be reloaded on resume.
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_generated_basic_credential(b"server")
+            .unwrap();
+        let client_config = ClientConfig::builder()
+            .with_no_certificate_verification()
+            .with_generated_basic_credential(b"client")
+            .unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+
+        // Connection 1: fresh handshake + app data at epoch 1.
+        let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
+        let mut client1 =
+            ClientConnection::new(client_config.clone(), name.clone()).unwrap();
+        for _ in 0..8 {
+            let a = pump(&mut server1, &mut client1);
+            let b = pump(&mut client1, &mut server1);
+            if a == 0 && b == 0 {
+                break;
+            }
+        }
+        assert!(!client1.is_handshaking());
+        assert_eq!(send(&mut client1, &mut server1, b"epoch1"), b"epoch1");
+        let resumption = client1.export_resumption_state().unwrap();
+
+        // Connection 2: resume over a fresh transport, then app data on the resumed epoch.
+        let mut server2 = ServerConnection::new(server_config.clone()).unwrap();
+        let mut client2 =
+            ClientConnection::resume(client_config.clone(), name, resumption).unwrap();
+        for _ in 0..8 {
+            let a = pump(&mut server2, &mut client2);
+            let b = pump(&mut client2, &mut server2);
+            if a == 0 && b == 0 {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking(), "resumed client still handshaking");
+        assert!(!server2.is_handshaking(), "resumed server still handshaking");
+        assert_eq!(send(&mut client2, &mut server2, b"epoch2"), b"epoch2");
+        assert_eq!(send(&mut server2, &mut client2, b"epoch2 back"), b"epoch2 back");
     }
 }

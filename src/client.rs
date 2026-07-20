@@ -21,11 +21,13 @@ use rustls_pki_types::ServerName;
 
 use crate::builder::ConfigBuilder;
 use crate::conn::ConnectionCommon;
+use crate::create_record_layer;
 use crate::crypto::provider::MlsTlsCryptoProvider;
 use crate::error::Error;
 use crate::mls_config::build_mls_client;
-use crate::mls_two_party_profile_00::initial_key_agreement_initiator_1;
+use crate::mls_two_party_profile_00::{Mls2Party, Role, initial_key_agreement_initiator_1};
 use crate::resumption::ResumptionState;
+use crate::tls_record::Role as Side;
 
 /// The default cipher suite: the custom X-Wing suite (`0x004e`) used for interop with the Python
 /// implementation. The CURVE25519 suite remains selectable via the crypto provider for the crate's
@@ -190,10 +192,24 @@ impl ClientConnection {
         server_name: ServerName<'static>,
         state: ResumptionState,
     ) -> Result<Self, Error> {
-        // Cross-connection resumption over the new (Python-aligned) framing is wired up in a later
-        // phase; the group reload + ResumptionRequest path is retained in the design.
-        let _ = (config, server_name, state);
-        Err(Error::Unsupported("resumption not yet wired to the new framing"))
+        // Reload the persisted group, create + merge a self-update commit (advancing to the new
+        // epoch), and build the fresh record layer. The connection then sends a Resumption and awaits
+        // the server's ConnectionConfirmation. The server's identity was pinned at the original
+        // handshake, so `server_name` is not re-checked here.
+        let client = build_mls_client(
+            config.signing_identity.clone(),
+            config.signer.clone(),
+            config.cipher_suite,
+            config.group_state_storage.clone(),
+        );
+        let mut group = client.load_group(&state.group_id)?;
+        let mut two_party = Mls2Party::new(Role::Initiator);
+        let commit = two_party.create_resumption_and_merge(&mut group)?;
+        let record = create_record_layer(&group, Side::Client);
+        group.write_to_storage()?;
+        let inner =
+            ConnectionCommon::new_client_resuming(group, record, two_party, server_name, commit)?;
+        Ok(Self { inner })
     }
 }
 

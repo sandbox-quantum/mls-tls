@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 Live interop driver: run this repo's Rust MLS-TLS binaries against the Python
-`mls-tls-python-pedantic` peers over real TCP sockets, in both pairings.
+`mls-tls-python-pedantic` peers over real TCP sockets, in both directions, covering the initial
+handshake, a mid-session rekey, and cross-connection resumption.
 
-  A. Python e2e_client  <->  Rust simple_server
-  B. Rust  simple_client <->  Python e2e_server
+Pairings:
+  A  Python e2e_client        <->  Rust simple_server      (handshake + app-data)
+  B  Rust  simple_client      <->  Python e2e_server       (handshake + app-data)
+  K1 Rust  rekey_peer client  <->  Python py_rekey server  (client-initiated rekey)
+  K2 Python py_rekey client   <->  Rust  rekey_peer server (client-initiated rekey)
+  R1 Rust  resume_client      <->  Python py_resume server (cross-connection resumption)
+  R2 Python py_resume client  <->  Rust  resume_server     (cross-connection resumption)
 
-A pairing passes when the initial handshake completes and both peers recover each
-other's plaintext application-data message.
-
-This driver ONLY reads the Python project (it never modifies it). It runs the
-Python peers with this repo's interop venv, which has `mlkem`, `ecdsa`,
-`cryptography` installed. Build the Rust binaries first:
+A pairing passes when every expected substring appears in the right peer's stdout. This driver only
+READS the Python project; it runs the Python peers with this repo's interop venv (mlkem/ecdsa/...).
 
     cargo build --bins
     interop/.venv/bin/python interop/run_live.py
@@ -24,15 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 PY_DIR = Path.home() / "workspace/mls-tls-paper/mls-tls/playground/mls-tls-python-pedantic"
 VENV_PY = REPO / "interop/.venv/bin/python"
-RUST_SERVER = REPO / "target/debug/simple_server"
-RUST_CLIENT = REPO / "target/debug/simple_client"
-
-PY_CLIENT_MSG = "Hello from client (python)!"
-PY_SERVER_MSG = "Hello from server (python)!"
-RUST_CLIENT_MSG = "Hello from client (rust)!"
-RUST_SERVER_MSG = "Hello from server (rust)!"
-
-PORT_A, PORT_B = 8371, 8372
+BIN = REPO / "target/debug"
 
 
 class Peer:
@@ -53,12 +47,12 @@ class Peer:
             if is_err and self._token and self._token in line:
                 self._ready.set()
 
-    def wait_ready(self, timeout):
-        return self._ready.wait(timeout)
+    def wait_ready(self, t):
+        return self._ready.wait(t)
 
-    def wait(self, timeout):
+    def wait(self, t):
         try:
-            return self.proc.wait(timeout=timeout)
+            return self.proc.wait(timeout=t)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             return -1
@@ -72,59 +66,93 @@ class Peer:
 
 def run_pairing(name, server_cmd, server_cwd, server_ready, client_cmd, client_cwd,
                 expect_server, expect_client) -> bool:
-    print(f"\n{name}")
     server = Peer(server_cmd, server_cwd, server_ready)
     if not server.wait_ready(20):
-        print(f"    ✗ server not ready; stderr: {server.err().strip()[-300:]}")
+        print(f"  [FAIL] {name}: server not ready — {server.err().strip()[-200:]}")
         server.wait(1)
         return False
     client = Peer(client_cmd, client_cwd, ready_token="")
     client.wait(30)
     server.wait(15)
-
-    server_ok = expect_server in server.out()
-    client_ok = expect_client in client.out()
-    print(f"    server received expected: {server_ok}")
-    print(f"    client received expected: {client_ok}")
-    if not (server_ok and client_ok):
-        print(f"    server stderr(tail): {server.err().strip().splitlines()[-3:]}")
-        print(f"    client stderr(tail): {client.err().strip().splitlines()[-3:]}")
-    ok = server_ok and client_ok
-    print("    => PASS" if ok else "    => FAIL")
+    so, co = server.out(), client.out()
+    ok = all(s in so for s in expect_server) and all(c in co for c in expect_client)
+    if not ok:
+        print(f"  [FAIL] {name}")
+        print(f"         server out: {so.strip()[-200:]}")
+        print(f"         client out: {co.strip()[-200:]}")
+        print(f"         server err: {server.err().strip().splitlines()[-2:]}")
+        print(f"         client err: {client.err().strip().splitlines()[-2:]}")
+    else:
+        print(f"  [PASS] {name}")
     return ok
 
 
+def rust(*args):
+    return [BIN / args[0], *args[1:]]
+
+
+def py(script, *args):
+    return [VENV_PY, script, *args]
+
+
 def main() -> int:
-    for exe in (RUST_SERVER, RUST_CLIENT):
-        if not exe.exists():
-            print(f"✗ missing {exe} — run `cargo build --bins` first")
+    for exe in ("simple_server", "simple_client", "rekey_peer", "resume_server", "resume_client"):
+        if not (BIN / exe).exists():
+            print(f"missing {BIN / exe} — run `cargo build --bins` first")
             return 1
 
     results = {}
-    results["A: Python client <-> Rust server"] = run_pairing(
-        "[A] Python client  <->  Rust simple_server",
-        server_cmd=[RUST_SERVER, PORT_A], server_cwd=REPO, server_ready="listening",
-        client_cmd=[VENV_PY, "e2e_client.py", "--port", PORT_A, "--message", PY_CLIENT_MSG],
-        client_cwd=PY_DIR,
-        expect_server=f"SERVER_RECEIVED: {PY_CLIENT_MSG}",
-        expect_client=f"CLIENT_RECEIVED: {RUST_SERVER_MSG}",
+
+    results["A  Py client  <-> Rust server (handshake)"] = run_pairing(
+        "A  handshake: Python client <-> Rust simple_server",
+        rust("simple_server", "8421"), REPO, "listening",
+        py("e2e_client.py", "--port", "8421", "--message", "Hello from client (python)!"), PY_DIR,
+        ["SERVER_RECEIVED: Hello from client (python)!"],
+        ["CLIENT_RECEIVED: Hello from server (rust)!"],
     )
-    results["B: Rust client <-> Python server"] = run_pairing(
-        "[B] Rust simple_client  <->  Python server",
-        server_cmd=[VENV_PY, "e2e_server.py", "--port", PORT_B, "--message", PY_SERVER_MSG],
-        server_cwd=PY_DIR, server_ready="SERVER_LISTENING",
-        client_cmd=[RUST_CLIENT, PORT_B], client_cwd=REPO,
-        expect_server=f"SERVER_RECEIVED: {RUST_CLIENT_MSG}",
-        expect_client=f"CLIENT_RECEIVED: {PY_SERVER_MSG}",
+    results["B  Rust client <-> Py server (handshake)"] = run_pairing(
+        "B  handshake: Rust simple_client <-> Python server",
+        py("e2e_server.py", "--port", "8422", "--message", "Hello from server (python)!"), PY_DIR, "SERVER_LISTENING",
+        rust("simple_client", "8422"), REPO,
+        ["SERVER_RECEIVED: Hello from client (rust)!"],
+        ["CLIENT_RECEIVED: Hello from server (python)!"],
+    )
+    results["K1 Rust client <-> Py server (rekey)"] = run_pairing(
+        "K1 rekey: Rust rekey_peer client <-> Python py_rekey server",
+        py("interop/py_rekey.py", "server", "8423"), REPO, "SERVER_LISTENING",
+        rust("rekey_peer", "client", "8423"), REPO,
+        ["rekey1 (rust client)", "rekey2 (rust client)"],
+        ["CLIENT_RECEIVED_1: ack1 (python server)", "CLIENT_RECEIVED_2: ack2 (python server)"],
+    )
+    results["K2 Py client  <-> Rust server (rekey)"] = run_pairing(
+        "K2 rekey: Python py_rekey client <-> Rust rekey_peer server",
+        rust("rekey_peer", "server", "8424"), REPO, "listening",
+        py("interop/py_rekey.py", "client", "8424"), REPO,
+        ["rekey1 (python client)", "rekey2 (python client)"],
+        ["CLIENT_RECEIVED_1: ack1 (rust server)", "CLIENT_RECEIVED_2: ack2 (rust server)"],
+    )
+    results["R1 Rust client <-> Py server (resume)"] = run_pairing(
+        "R1 resume: Rust resume_client <-> Python py_resume server",
+        py("interop/py_resume.py", "server", "8425"), REPO, "SERVER_LISTENING",
+        rust("resume_client", "8425"), REPO,
+        ["hello1 (rust client)", "hello2 (rust client)"],
+        ["CLIENT_RECEIVED_1: ack1 (python server)", "CLIENT_RECEIVED_2: ack2 (python server)"],
+    )
+    results["R2 Py client  <-> Rust server (resume)"] = run_pairing(
+        "R2 resume: Python py_resume client <-> Rust resume_server",
+        rust("resume_server", "8426"), REPO, "listening",
+        py("interop/py_resume.py", "client", "8426"), REPO,
+        ["hello1 (python client)", "hello2 (python client)"],
+        ["CLIENT_RECEIVED_1: ack1 (rust server)", "CLIENT_RECEIVED_2: ack2 (rust server)"],
     )
 
-    print("\n" + "=" * 60)
-    print("LIVE INTEROP SUMMARY")
-    print("=" * 60)
+    print("\n" + "=" * 64)
+    print("LIVE INTEROP SUMMARY (Rust <-> Python, custom X-Wing 0x004e)")
+    print("=" * 64)
     for name, ok in results.items():
         print(f"  [{'PASS' if ok else 'FAIL'}]  {name}")
     all_ok = all(results.values())
-    print("=" * 60)
+    print("=" * 64)
     print("ALL PAIRINGS PASSED" if all_ok else "SOME PAIRINGS FAILED")
     return 0 if all_ok else 1
 

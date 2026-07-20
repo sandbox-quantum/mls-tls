@@ -61,6 +61,8 @@ enum HsState {
     ClientAwaitingServerPubkey,
     /// Client: sent ClientHello, waiting for the ServerHello (Welcome).
     ClientAwaitingServerHello,
+    /// Client (resumption): sent the Resumption, waiting for the ConnectionConfirmation.
+    ClientAwaitingConfirmation,
     /// Server: sent its public key, waiting for the ClientHello.
     ServerAwaitingClientHello,
     /// The initial key agreement is complete.
@@ -100,6 +102,8 @@ pub struct ConnectionCommon {
     received_plaintext: VecDeque<u8>,
     sendable_tls: VecDeque<u8>,
     peer_closed: bool,
+    /// For a resuming client: the self-update commit to send in the Resumption message.
+    resumption_commit: Option<MlsMessage>,
 }
 
 impl ConnectionCommon {
@@ -129,6 +133,39 @@ impl ConnectionCommon {
             received_plaintext: VecDeque::new(),
             sendable_tls: VecDeque::new(),
             peer_closed: false,
+            resumption_commit: None,
+        })
+    }
+
+    /// Construct a resuming client core: the group is already reloaded and advanced (its self-update
+    /// commit merged), and the record layer built at the new epoch. It waits for the server pubkey,
+    /// sends the Resumption, then awaits the `ConnectionConfirmation`.
+    pub(crate) fn new_client_resuming(
+        group: MlsGroup,
+        record: RecordLayer,
+        two_party: Mls2Party,
+        server_name: ServerName<'static>,
+        request_commit: MlsMessage,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            side: Side::Client,
+            state: HsState::ClientAwaitingServerPubkey,
+            group: Some(group),
+            record: Some(record),
+            two_party: Some(two_party),
+            client_ctx: Some(ClientCtx {
+                client: placeholder_client(),
+                verifier: ServerCertVerifier::None,
+                server_name,
+                pending_client_hello: request_commit.clone(),
+                server_pubkey: None,
+            }),
+            server_ctx: None,
+            deframer: MessageDeframer::new(),
+            received_plaintext: VecDeque::new(),
+            sendable_tls: VecDeque::new(),
+            peer_closed: false,
+            resumption_commit: Some(request_commit),
         })
     }
 
@@ -149,6 +186,7 @@ impl ConnectionCommon {
             received_plaintext: VecDeque::new(),
             sendable_tls,
             peer_closed: false,
+            resumption_commit: None,
         })
     }
 
@@ -230,6 +268,7 @@ impl ConnectionCommon {
         match self.state {
             HsState::ClientAwaitingServerPubkey => self.client_on_server_pubkey(payload),
             HsState::ClientAwaitingServerHello => self.client_on_server_hello(payload),
+            HsState::ClientAwaitingConfirmation => self.client_on_confirmation(payload),
             HsState::ServerAwaitingClientHello => self.server_on_client_hello(payload),
             HsState::Established => self.on_established(payload),
         }
@@ -241,10 +280,37 @@ impl ConnectionCommon {
             .as_mut()
             .ok_or(Error::UnexpectedMessage("no client context"))?;
         ctx.server_pubkey = Some(payload);
-        let bytes = Envelope::ClientHello(ctx.pending_client_hello.clone()).encode()?;
-        self.sendable_tls.extend(frame_transport(&bytes));
-        self.state = HsState::ClientAwaitingServerHello;
+
+        if let Some(commit) = self.resumption_commit.take() {
+            // Resumption: send a Resumption envelope instead of a ClientHello.
+            let bytes = Envelope::Resumption(commit).encode()?;
+            self.sendable_tls.extend(frame_transport(&bytes));
+            self.state = HsState::ClientAwaitingConfirmation;
+        } else {
+            let bytes = Envelope::ClientHello(ctx.pending_client_hello.clone()).encode()?;
+            self.sendable_tls.extend(frame_transport(&bytes));
+            self.state = HsState::ClientAwaitingServerHello;
+        }
         Ok(())
+    }
+
+    fn client_on_confirmation(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        // The resuming client already merged its commit and installed the new-epoch keys; the
+        // ConnectionConfirmation only validates the announced epoch.
+        match Signaling::decode(&payload)? {
+            Signaling::ConnectionConfirmation(epoch) => {
+                let group = self
+                    .group
+                    .as_ref()
+                    .ok_or(Error::UnexpectedMessage("resume without group"))?;
+                if epoch != group.current_epoch() {
+                    return Err(Error::UnexpectedMessage("resumption epoch mismatch"));
+                }
+                self.state = HsState::Established;
+                Ok(())
+            }
+            _ => Err(Error::UnexpectedMessage("expected ConnectionConfirmation")),
+        }
     }
 
     fn client_on_server_hello(&mut self, payload: Vec<u8>) -> Result<(), Error> {
@@ -301,8 +367,33 @@ impl ConnectionCommon {
                 self.state = HsState::Established;
                 Ok(())
             }
-            Envelope::Resumption(_) => {
-                Err(Error::Unsupported("resumption not yet wired to the new framing"))
+            Envelope::Resumption(commit) => {
+                // Reload the group named by the commit, apply the initiator's update, and reply with
+                // a bare ConnectionConfirmation (the reference/Python model — no responder commit).
+                let group_id = commit
+                    .group_id()
+                    .ok_or(Error::Decode("resumption commit missing group id"))?
+                    .to_vec();
+                let server = crate::mls_config::build_mls_client(
+                    ctx.signing_identity,
+                    ctx.signer,
+                    ctx.cipher_suite,
+                    ctx.storage,
+                );
+                let mut group = server.load_group(&group_id)?;
+                let mut two_party = Mls2Party::new(Role::Responder);
+                let new_epoch = two_party.apply_resumption(&mut group, commit)?;
+
+                let record = create_record_layer(&group, Side::Server);
+                group.write_to_storage()?;
+
+                self.send_signaling(Signaling::ConnectionConfirmation(new_epoch))?;
+
+                self.group = Some(group);
+                self.record = Some(record);
+                self.two_party = Some(two_party);
+                self.state = HsState::Established;
+                Ok(())
             }
         }
     }
@@ -444,6 +535,25 @@ impl ConnectionCommon {
         }
         Ok(())
     }
+}
+
+/// A throwaway `MlsClient` held (never used) by a resuming connection's `ClientCtx`, which operates
+/// entirely on its reloaded group.
+fn placeholder_client() -> MlsClient {
+    use mls_rs::identity::basic::BasicCredential;
+    use mls_rs::{CipherSuiteProvider, CryptoProvider};
+    let csp = MlsTlsCryptoProvider::new()
+        .cipher_suite_provider(crate::crypto::XWING_CIPHER_SUITE)
+        .expect("x-wing suite");
+    let (secret, public) = csp.signature_key_generate().expect("keygen");
+    let identity =
+        SigningIdentity::new(BasicCredential::new(b"resume".to_vec()).into_credential(), public);
+    crate::mls_config::build_mls_client(
+        identity,
+        secret,
+        crate::crypto::XWING_CIPHER_SUITE,
+        InMemoryGroupStateStorage::default(),
+    )
 }
 
 /// Verify the server's credential per policy plus the pre-handshake public-key binding.

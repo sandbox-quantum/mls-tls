@@ -120,6 +120,9 @@ impl Envelope {
 }
 
 /// A steady-state `SignalingMessage`: a rekey commit, an epoch confirmation, or a resumption ack.
+// The ConnectionUpdate variant carries an MlsMessage (large) while the others are just a u64; this
+// is a short-lived wire-decode enum, so the size difference is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Signaling {
     /// A rekey commit (MLS `PrivateMessage`), with the `update_requested` flag.
     ConnectionUpdate { update_requested: bool, commit: MlsMessage },

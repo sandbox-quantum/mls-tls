@@ -463,10 +463,22 @@ impl IntoAnyError for TwoPartyRulesError {
 }
 
 #[derive(Clone)]
-#[derive(Default)]
 pub struct TwoPartyMlsRules {
     commit_options: CommitOptions,
     encryption_options: EncryptionOptions,
+}
+
+impl Default for TwoPartyMlsRules {
+    fn default() -> Self {
+        Self {
+            commit_options: CommitOptions::default(),
+            // Encrypt control messages so member commits are MLS PrivateMessages (wire_format
+            // 0x0002), matching the Python peer's ConnectionUpdate / Resumption framing (its parser
+            // rejects a PublicMessage commit). `PaddingMode::None` matches the Python framing;
+            // receivers tolerate any padding regardless.
+            encryption_options: EncryptionOptions::new(true, mls_rs::client_builder::PaddingMode::None),
+        }
+    }
 }
 
 
@@ -535,6 +547,39 @@ pub(crate) struct ResumptionResponse {
 }
 
 impl Mls2Party {
+    /// Client resumption (the reference's `ConnectionConfirmation` model, matching the Python peer):
+    /// create a self-update commit and **merge it immediately**, advancing to the new epoch. Returns
+    /// the commit to carry in the Resumption message. The responder replies with a bare
+    /// `ConnectionConfirmation` (no responder commit), so the initiator installs both new-epoch
+    /// directions now (over a fresh transport there are no in-flight old-epoch records to preserve).
+    pub(crate) fn create_resumption_and_merge(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+    ) -> Result<MlsMessage, TwoPartyError> {
+        group.propose_update(vec![])?;
+        let commit = group.commit(vec![])?;
+        group.apply_pending_commit()?;
+        self.role = Role::Initiator;
+        self.state = State::Synced;
+        Ok(commit.commit_message)
+    }
+
+    /// Responder resumption: validate and apply the initiator's commit, advancing to the new epoch.
+    /// Returns the new epoch to announce in the `ConnectionConfirmation`.
+    pub(crate) fn apply_resumption(
+        &mut self,
+        group: &mut Group<impl MlsConfig>,
+        commit: MlsMessage,
+    ) -> Result<u64, TwoPartyError> {
+        group.clear_pending_commit();
+        group.clear_proposal_cache();
+        group.process_incoming_message(commit)?;
+        self.role = Role::Responder;
+        self.state = State::Synced;
+        Ok(group.current_epoch())
+    }
+
+    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
     pub(crate) fn create_resumption_request(
         &mut self,
         group: &mut Group<impl MlsConfig>,
@@ -565,6 +610,7 @@ impl Mls2Party {
         // The initiator MUST then wait for a ResumptionResponse.
     }
 
+    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
     pub(crate) fn handle_resumption_request(
         &mut self,
         group: &mut Group<impl MlsConfig>,
@@ -629,6 +675,7 @@ impl Mls2Party {
         }
     }
 
+    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
     pub(crate) fn handle_resumption_response(
         &mut self,
         group: &mut Group<impl MlsConfig>,
