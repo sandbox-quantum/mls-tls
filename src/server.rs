@@ -1,33 +1,28 @@
-//! Server-side configuration: `ServerConfig` + its typestate builder stages.
+//! Server-side configuration: `ServerConfig` + its typestate builder stages, and `ServerConnection`.
 //!
 //! `client_verifier` is the policy for how the server checks the **client's** credential from the
 //! incoming KeyPackage (consumed by `web_pki::validate_client_credential` at the handshake, not the
 //! mls-rs identity provider).
+//!
+//! Unlike rustls, there is no `Acceptor`: the server speaks first (it sends its signing public key
+//! before the ClientHello), so a [`ServerConnection`] is created directly from a config and the
+//! ClientHello is consumed inside `process_new_packets`.
 
-use std::io::Read;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use mls_rs::{
-    CipherSuite, MlsMessage,
+    CipherSuite,
     crypto::{SignaturePublicKey, SignatureSecretKey},
     identity::{SigningIdentity, basic::BasicCredential, x509::CertificateChain},
     storage_provider::in_memory::InMemoryGroupStateStorage,
 };
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::TrustAnchor;
 
 use crate::builder::ConfigBuilder;
 use crate::client::{CIPHER_SUITE, generate_signature_key};
-use crate::conn::ConnectionCommon;
-use crate::create_record_layer;
-use crate::deframer::{HandshakePayload, MessageDeframer};
+use crate::conn::{ConnectionCommon, ServerCtx};
 use crate::error::Error;
-use crate::mls_config::build_mls_client;
-use crate::mls_two_party_profile_00::{
-    ClientHello, Mls2Party, ResumptionRequest, Role, initial_key_agreement_responder_1,
-};
-use crate::tls_record::{ContentType, Role as Side};
 
 /// How the server verifies the **client's** credential.
 #[derive(Clone)]
@@ -36,8 +31,7 @@ pub enum ClientCertVerifier {
     Basic,
     /// Require and validate a client X.509 certificate against these anchors.
     ///
-    /// Not yet implemented end-to-end — selecting this surfaces `Error::Unsupported` at handshake
-    /// (the X.509 arm of `validate_client_credential` is a stub).
+    /// Not yet implemented end-to-end — selecting this surfaces `Error::Unsupported` at handshake.
     WebPki {
         trust_anchors: Vec<TrustAnchor<'static>>,
     },
@@ -90,7 +84,8 @@ impl ConfigBuilder<ServerConfig, WantsClientVerifier> {
 }
 
 impl ConfigBuilder<ServerConfig, WantsServerCredential> {
-    /// Use a shared [`SessionStore`] so resumed connections can reload groups established here.
+    /// Use a shared [`SessionStore`](crate::resumption::SessionStore) so resumed connections can
+    /// reload groups established here.
     pub fn with_session_store(mut self, store: crate::resumption::SessionStore) -> Self {
         self.state.session_store = store.storage;
         self
@@ -128,8 +123,8 @@ impl ConfigBuilder<ServerConfig, WantsServerCredential> {
         })
     }
 
-    /// Generate a fresh Ed25519 key and use a Basic credential (convenience, mainly for testing /
-    /// examples where the server does not present an X.509 certificate).
+    /// Generate a fresh key and use a Basic credential (convenience for testing / examples where the
+    /// server does not present an X.509 certificate).
     pub fn with_generated_basic_credential(
         self,
         name: &[u8],
@@ -147,155 +142,25 @@ impl ConfigBuilder<ServerConfig, WantsServerCredential> {
     }
 }
 
-/// A read-only view of the offered ClientHello, for config selection before `into_connection`.
-pub struct ClientHelloInfo<'a> {
-    key_package: &'a MlsMessage,
-}
-
-impl ClientHelloInfo<'_> {
-    /// The cipher suite offered in the client's KeyPackage, if it parses as one.
-    pub fn cipher_suite(&self) -> Option<CipherSuite> {
-        self.key_package.as_key_package().map(|kp| kp.cipher_suite)
-    }
-}
-
-/// What the [`Acceptor`] parsed off the wire: a fresh ClientHello or a cross-connection resumption.
-enum AcceptedKind {
-    Fresh(ClientHello),
-    Resume(MlsMessage),
-}
-
-/// Server-side pre-config handshake acceptor: read the incoming ClientHello (KeyPackage) — or a
-/// cross-connection ResumptionRequest — before choosing a [`ServerConfig`]. Mirrors rustls' `Acceptor`.
-pub struct Acceptor {
-    deframer: MessageDeframer,
-    accepted: Option<AcceptedKind>,
-}
-
-impl Acceptor {
-    pub fn new() -> Self {
-        Self {
-            deframer: MessageDeframer::new(),
-            accepted: None,
-        }
-    }
-
-    /// Feed raw TLS bytes from the transport.
-    pub fn read_tls(&mut self, rd: &mut dyn Read) -> std::io::Result<usize> {
-        let mut buf = [0u8; 8192];
-        let n = rd.read(&mut buf)?;
-        self.deframer.push(&buf[..n]);
-        Ok(n)
-    }
-
-    /// Returns `Some(Accepted)` once a full opening message has been buffered.
-    pub fn accept(&mut self) -> Result<Option<Accepted>, Error> {
-        if self.accepted.is_none()
-            && let Some(frame) = self.deframer.pop()? {
-                if frame.outer_type != ContentType::Handshake as u8 {
-                    return Err(Error::UnexpectedMessage("expected a handshake frame"));
-                }
-                self.accepted = Some(match HandshakePayload::decode(frame.body())? {
-                    HandshakePayload::ClientHello(key_package) => {
-                        AcceptedKind::Fresh(ClientHello { key_package })
-                    }
-                    HandshakePayload::ResumptionRequest(commit) => AcceptedKind::Resume(commit),
-                    _ => {
-                        return Err(Error::UnexpectedMessage(
-                            "expected a ClientHello or ResumptionRequest",
-                        ));
-                    }
-                });
-            }
-        Ok(self.accepted.take().map(|kind| Accepted { kind }))
-    }
-}
-
-impl Default for Acceptor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A buffered opening message awaiting a config choice.
-pub struct Accepted {
-    kind: AcceptedKind,
-}
-
-impl Accepted {
-    /// Whether this is a cross-connection resumption (rather than a fresh handshake).
-    pub fn is_resumption(&self) -> bool {
-        matches!(self.kind, AcceptedKind::Resume(_))
-    }
-
-    /// Inspect the offered ClientHello (KeyPackage) before choosing a config. `None` for a resumption.
-    pub fn client_hello(&self) -> Option<ClientHelloInfo<'_>> {
-        match &self.kind {
-            AcceptedKind::Fresh(ch) => Some(ClientHelloInfo {
-                key_package: &ch.key_package,
-            }),
-            AcceptedKind::Resume(_) => None,
-        }
-    }
-
-    /// Complete the responder side with the chosen config, producing a `ServerConnection` that has
-    /// queued its ServerHello (fresh) or ResumptionResponse (resumption).
-    pub fn into_connection(self, config: Arc<ServerConfig>) -> Result<ServerConnection, Error> {
-        match self.kind {
-            AcceptedKind::Fresh(client_hello) => {
-                if let ClientCertVerifier::WebPki { .. } = config.client_verifier {
-                    // The X.509 client-auth arm of validate_client_credential is not implemented yet.
-                    return Err(Error::Unsupported("client certificate verification"));
-                }
-                let (server_hello, mut group) = initial_key_agreement_responder_1(
-                    client_hello,
-                    config.signing_identity.clone(),
-                    config.signer.clone(),
-                    config.cipher_suite,
-                    config.group_state_storage.clone(),
-                )?;
-                let record =
-                    create_record_layer(&group, Side::Server, RustCryptoProvider::default());
-                group.write_to_storage()?; // persist for resumption
-                let inner =
-                    ConnectionCommon::new_server_established(group, record, server_hello.welcome)?;
-                Ok(ServerConnection { inner })
-            }
-            AcceptedKind::Resume(commit) => {
-                // Reload the persisted group named by the commit, apply the resumption, and reply.
-                let group_id = commit
-                    .group_id()
-                    .ok_or(Error::Decode("resumption commit missing group id"))?
-                    .to_vec();
-                let server = build_mls_client(
-                    config.signing_identity.clone(),
-                    config.signer.clone(),
-                    config.cipher_suite,
-                    config.group_state_storage.clone(),
-                );
-                let mut group = server.load_group(&group_id)?;
-                let mut two_party = Mls2Party::new(Role::Responder);
-                let response = two_party
-                    .handle_resumption_request(&mut group, ResumptionRequest { commit })?
-                    .ok_or(Error::UnexpectedMessage("resumption produced no response"))?;
-                let record =
-                    create_record_layer(&group, Side::Server, RustCryptoProvider::default());
-                group.write_to_storage()?;
-                let inner = ConnectionCommon::new_server_resumed(
-                    group,
-                    record,
-                    two_party,
-                    response.commit,
-                )?;
-                Ok(ServerConnection { inner })
-            }
-        }
-    }
-}
-
 /// A single MLS-TLS server connection (the responder). Deref's to [`ConnectionCommon`].
 pub struct ServerConnection {
     inner: ConnectionCommon,
+}
+
+impl ServerConnection {
+    /// Start a server connection. It queues the server's public key immediately; drive the handshake
+    /// by pumping `write_tls` / `read_tls` + `process_new_packets` until `is_handshaking()` is false.
+    pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+        let server_ctx = ServerCtx {
+            signing_identity: config.signing_identity.clone(),
+            signer: config.signer.clone(),
+            cipher_suite: config.cipher_suite,
+            storage: config.group_state_storage.clone(),
+            client_verifier: config.client_verifier.clone(),
+        };
+        let inner = ConnectionCommon::new_server(server_ctx)?;
+        Ok(Self { inner })
+    }
 }
 
 impl Deref for ServerConnection {

@@ -13,7 +13,6 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential},
     storage_provider::in_memory::InMemoryGroupStateStorage,
 };
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use rustls_pki_types::TrustAnchor;
 
 use std::ops::{Deref, DerefMut};
@@ -22,13 +21,16 @@ use rustls_pki_types::ServerName;
 
 use crate::builder::ConfigBuilder;
 use crate::conn::ConnectionCommon;
+use crate::crypto::provider::MlsTlsCryptoProvider;
 use crate::error::Error;
 use crate::mls_config::build_mls_client;
-use crate::mls_two_party_profile_00::{Mls2Party, Role, initial_key_agreement_initiator_1};
+use crate::mls_two_party_profile_00::initial_key_agreement_initiator_1;
 use crate::resumption::ResumptionState;
 
-/// The one cipher suite this crate supports (`TLS_AES_128_GCM_SHA256`).
-pub(crate) const CIPHER_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
+/// The default cipher suite: the custom X-Wing suite (`0x004e`) used for interop with the Python
+/// implementation. The CURVE25519 suite remains selectable via the crypto provider for the crate's
+/// own tests.
+pub(crate) const CIPHER_SUITE: CipherSuite = crate::crypto::XWING_CIPHER_SUITE;
 
 /// How the client verifies the **server's** credential.
 ///
@@ -144,9 +146,9 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
     }
 }
 
-/// Generate an Ed25519 signature keypair for the fixed cipher suite.
+/// Generate a signature keypair for the default cipher suite (ECDSA-P384 for X-Wing).
 pub(crate) fn generate_signature_key() -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
-    let csp = RustCryptoProvider::default()
+    let csp = MlsTlsCryptoProvider::new()
         .cipher_suite_provider(CIPHER_SUITE)
         .ok_or(Error::Unsupported("cipher suite unavailable"))?;
     csp.signature_key_generate()
@@ -188,20 +190,10 @@ impl ClientConnection {
         server_name: ServerName<'static>,
         state: ResumptionState,
     ) -> Result<Self, Error> {
-        // The responder's identity was verified at the original handshake and is pinned across
-        // resumption, so no re-verification (and hence no use of server_name) is needed here.
-        let _ = server_name;
-        let client = build_mls_client(
-            config.signing_identity.clone(),
-            config.signer.clone(),
-            config.cipher_suite,
-            config.group_state_storage.clone(),
-        );
-        let mut group = client.load_group(&state.group_id)?;
-        let mut two_party = Mls2Party::new(Role::Initiator);
-        let request = two_party.create_resumption_request(&mut group)?;
-        let inner = ConnectionCommon::new_client_resuming(group, two_party, request.commit)?;
-        Ok(Self { inner })
+        // Cross-connection resumption over the new (Python-aligned) framing is wired up in a later
+        // phase; the group reload + ResumptionRequest path is retained in the design.
+        let _ = (config, server_name, state);
+        Err(Error::Unsupported("resumption not yet wired to the new framing"))
     }
 }
 

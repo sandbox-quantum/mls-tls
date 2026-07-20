@@ -78,7 +78,10 @@ pub(crate) fn initial_key_agreement_responder_1(
             .as_key_package()
             .ok_or(TwoPartyError::NotAKeyPackage)?;
     let initiator_offered_ciphersuite = initiator_key_package.cipher_suite;
-    let server_supported_ciphersuites = CipherSuite::all().collect::<BTreeSet<_>>();
+    // Standard suites (1–7) plus the custom X-Wing suite (0x004e) our crypto provider adds.
+    let server_supported_ciphersuites = CipherSuite::all()
+        .chain(std::iter::once(crate::crypto::XWING_CIPHER_SUITE))
+        .collect::<BTreeSet<_>>();
 
     // IMPLEMENTOR NOTE: MLS 2-party profile doesn't support ciphersuite negotiation.
 

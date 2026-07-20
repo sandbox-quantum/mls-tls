@@ -1,34 +1,45 @@
-//! The sans-I/O connection core.
+//! The sans-I/O connection core, speaking the Python `mls-tls-python-pedantic` wire protocol.
 //!
-//! [`ConnectionCommon`] owns the MLS group, the TLS 1.3 record layer, and the two-party state
-//! machine, and exposes the rustls-shaped byte pipeline: feed ciphertext with [`read_tls`], drive
-//! processing with [`process_new_packets`], exchange plaintext via [`reader`]/[`writer`], and drain
-//! ciphertext with [`write_tls`]. Application data *and* in-band control both ride this one pipeline.
+//! Everything rides outer transport frames (content type `0x17`). The message sequence is:
+//! 1. server → client: the server's raw signing public key (pre-handshake);
+//! 2. client → server: ClientHello (`MlsTlsHandshake` envelope wrapping `MLSMessage(KeyPackage)`);
+//! 3. server → client: ServerHello (a bare `MLSMessage(Welcome)`);
+//! 4. both: application data (inner AEAD records) and plaintext `SignalingMessage`s (rekeys).
+//!
+//! The public byte pipeline is rustls-shaped: [`read_tls`]/[`write_tls`]/[`process_new_packets`]/
+//! [`reader`]/[`writer`]. Sending a rekey is explicit ([`refresh_traffic_keys`]); handling inbound
+//! control is automatic inside [`process_new_packets`].
 //!
 //! [`read_tls`]: ConnectionCommon::read_tls
 //! [`write_tls`]: ConnectionCommon::write_tls
 //! [`process_new_packets`]: ConnectionCommon::process_new_packets
 //! [`reader`]: ConnectionCommon::reader
 //! [`writer`]: ConnectionCommon::writer
+//! [`refresh_traffic_keys`]: ConnectionCommon::refresh_traffic_keys
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 
+use mls_rs::CipherSuite;
 use mls_rs::MlsMessage;
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+use mls_rs::crypto::SignatureSecretKey;
+use mls_rs::identity::SigningIdentity;
+use mls_rs::storage_provider::in_memory::InMemoryGroupStateStorage;
 use rustls_pki_types::ServerName;
 
 use crate::client::ServerCertVerifier;
 use crate::create_record_layer;
-use crate::deframer::{Frame, HandshakePayload, MessageDeframer, frame_plaintext_handshake};
+use crate::crypto::provider::MlsTlsCryptoProvider;
+use crate::deframer::{Envelope, MessageDeframer, Signaling, frame_transport, is_app_data};
 use crate::error::Error;
 use crate::mls_config::{MlsClient, MlsGroup};
-use crate::resumption::ResumptionState;
 use crate::mls_two_party_profile_00::{
-    ConnectionUpdate, EpochKeyUpdate, Mls2Party, ResumptionRequest, ResumptionResponse, Role,
-    ServerHello, initial_key_agreement_initiator_2,
+    ClientHello, ConnectionUpdate, EpochKeyUpdate, Mls2Party, Role, ServerHello,
+    initial_key_agreement_initiator_2, initial_key_agreement_responder_1,
 };
+use crate::resumption::ResumptionState;
+use crate::server::ClientCertVerifier;
 use crate::tls_record::{ContentType, DirectionalRekey, RecordLayer, Role as Side, TlsPlaintext};
 use crate::web_pki::validate_server_credential;
 
@@ -43,45 +54,66 @@ pub struct IoState {
     pub peer_has_closed: bool,
 }
 
-/// Client-side context retained until the `ServerHello` completes the handshake.
+/// Handshake progress of a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HsState {
+    /// Client: waiting for the server's pre-handshake public key.
+    ClientAwaitingServerPubkey,
+    /// Client: sent ClientHello, waiting for the ServerHello (Welcome).
+    ClientAwaitingServerHello,
+    /// Server: sent its public key, waiting for the ClientHello.
+    ServerAwaitingClientHello,
+    /// The initial key agreement is complete.
+    Established,
+}
+
+/// Client handshake context, retained until the handshake completes.
 pub(crate) struct ClientCtx {
     pub(crate) client: MlsClient,
     pub(crate) verifier: ServerCertVerifier,
     pub(crate) server_name: ServerName<'static>,
+    /// The ClientHello (KeyPackage) to send once the server pubkey arrives.
+    pub(crate) pending_client_hello: MlsMessage,
+    /// The server's pre-handshake signing public key, once received.
+    pub(crate) server_pubkey: Option<Vec<u8>>,
+}
+
+/// Server handshake context, retained until the ClientHello is processed.
+pub(crate) struct ServerCtx {
+    pub(crate) signing_identity: SigningIdentity,
+    pub(crate) signer: SignatureSecretKey,
+    pub(crate) cipher_suite: CipherSuite,
+    pub(crate) storage: InMemoryGroupStateStorage,
+    pub(crate) client_verifier: ClientCertVerifier,
 }
 
 /// The role-agnostic connection core. `ClientConnection`/`ServerConnection` `Deref` to this.
 pub struct ConnectionCommon {
     side: Side,
-    // Established protocol state (present once the handshake has produced a group).
+    state: HsState,
     group: Option<MlsGroup>,
     record: Option<RecordLayer>,
     two_party: Option<Mls2Party>,
-    // Client handshake context (present only while a client awaits the ServerHello).
     client_ctx: Option<ClientCtx>,
-    // I/O plumbing.
+    server_ctx: Option<ServerCtx>,
     deframer: MessageDeframer,
     received_plaintext: VecDeque<u8>,
     sendable_tls: VecDeque<u8>,
-    handshake_done: bool,
     peer_closed: bool,
-    // True for a client mid cross-connection resumption (awaiting a plaintext ResumptionResponse).
-    resuming_client: bool,
 }
 
 impl ConnectionCommon {
-    /// Construct a client core that has queued its ClientHello and awaits the ServerHello.
+    /// Construct a fresh client core. It waits for the server's pre-handshake public key before
+    /// sending its ClientHello (matching the Python peer's ordering).
     pub(crate) fn new_client(
         client: MlsClient,
         verifier: ServerCertVerifier,
         server_name: ServerName<'static>,
         client_hello_kp: MlsMessage,
     ) -> Result<Self, Error> {
-        let payload = HandshakePayload::ClientHello(client_hello_kp).encode()?;
-        let mut sendable_tls = VecDeque::new();
-        sendable_tls.extend(frame_plaintext_handshake(&payload));
         Ok(Self {
             side: Side::Client,
+            state: HsState::ClientAwaitingServerPubkey,
             group: None,
             record: None,
             two_party: None,
@@ -89,96 +121,40 @@ impl ConnectionCommon {
                 client,
                 verifier,
                 server_name,
+                pending_client_hello: client_hello_kp,
+                server_pubkey: None,
             }),
+            server_ctx: None,
             deframer: MessageDeframer::new(),
             received_plaintext: VecDeque::new(),
-            sendable_tls,
-            handshake_done: false,
+            sendable_tls: VecDeque::new(),
             peer_closed: false,
-            resuming_client: false,
         })
     }
 
-    /// Construct an established server core that has queued its ServerHello.
-    pub(crate) fn new_server_established(
-        group: MlsGroup,
-        record: RecordLayer,
-        server_hello_welcome: MlsMessage,
-    ) -> Result<Self, Error> {
-        let payload = HandshakePayload::ServerHello(server_hello_welcome).encode()?;
+    /// Construct a server core: queue the server's public key and await the ClientHello.
+    pub(crate) fn new_server(server_ctx: ServerCtx) -> Result<Self, Error> {
+        let pubkey = server_ctx.signing_identity.signature_key.as_bytes().to_vec();
         let mut sendable_tls = VecDeque::new();
-        sendable_tls.extend(frame_plaintext_handshake(&payload));
+        sendable_tls.extend(frame_transport(&pubkey));
         Ok(Self {
             side: Side::Server,
-            group: Some(group),
-            record: Some(record),
-            two_party: Some(Mls2Party::new(Role::Responder)),
-            client_ctx: None,
-            deframer: MessageDeframer::new(),
-            received_plaintext: VecDeque::new(),
-            sendable_tls,
-            handshake_done: true,
-            peer_closed: false,
-            resuming_client: false,
-        })
-    }
-
-    /// Construct a client core resuming from a reloaded group over a fresh transport. The
-    /// ResumptionRequest is queued as a *plaintext* frame (no record layer exists yet); the record
-    /// layer is built when the plaintext ResumptionResponse arrives.
-    pub(crate) fn new_client_resuming(
-        group: MlsGroup,
-        two_party: Mls2Party,
-        request_commit: MlsMessage,
-    ) -> Result<Self, Error> {
-        let payload = HandshakePayload::ResumptionRequest(request_commit).encode()?;
-        let mut sendable_tls = VecDeque::new();
-        sendable_tls.extend(frame_plaintext_handshake(&payload));
-        Ok(Self {
-            side: Side::Client,
-            group: Some(group),
+            state: HsState::ServerAwaitingClientHello,
+            group: None,
             record: None,
-            two_party: Some(two_party),
+            two_party: None,
             client_ctx: None,
+            server_ctx: Some(server_ctx),
             deframer: MessageDeframer::new(),
             received_plaintext: VecDeque::new(),
             sendable_tls,
-            handshake_done: false,
             peer_closed: false,
-            resuming_client: true,
-        })
-    }
-
-    /// Construct a resumed server core: the group is reloaded and already advanced to the resumed
-    /// epoch, the record layer is rebuilt, and the ResumptionResponse is queued as a plaintext frame.
-    pub(crate) fn new_server_resumed(
-        group: MlsGroup,
-        record: RecordLayer,
-        two_party: Mls2Party,
-        response_commit: MlsMessage,
-    ) -> Result<Self, Error> {
-        let payload = HandshakePayload::ResumptionResponse(response_commit).encode()?;
-        let mut sendable_tls = VecDeque::new();
-        sendable_tls.extend(frame_plaintext_handshake(&payload));
-        Ok(Self {
-            side: Side::Server,
-            group: Some(group),
-            record: Some(record),
-            two_party: Some(two_party),
-            client_ctx: None,
-            deframer: MessageDeframer::new(),
-            received_plaintext: VecDeque::new(),
-            sendable_tls,
-            handshake_done: true,
-            peer_closed: false,
-            resuming_client: false,
         })
     }
 
     // --- rustls-shaped byte pipeline ---
 
-    /// Read raw TLS bytes from `rd` into the internal buffer. Does not process them; call
-    /// [`process_new_packets`](Self::process_new_packets) afterwards.
+    /// Read raw TLS bytes from `rd`. Call [`process_new_packets`](Self::process_new_packets) after.
     pub fn read_tls(&mut self, rd: &mut dyn Read) -> io::Result<usize> {
         let mut buf = [0u8; 8192];
         let n = rd.read(&mut buf)?;
@@ -191,7 +167,6 @@ impl ConnectionCommon {
         if self.sendable_tls.is_empty() {
             return Ok(0);
         }
-        // Make the buffer contiguous so a single write can flush everything available.
         self.sendable_tls.make_contiguous();
         let (front, _) = self.sendable_tls.as_slices();
         let n = wr.write(front)?;
@@ -199,11 +174,11 @@ impl ConnectionCommon {
         Ok(n)
     }
 
-    /// Process buffered inbound records: advance the handshake, decrypt application data, and handle
-    /// in-band control messages (auto-queueing any replies).
+    /// Process buffered inbound frames: advance the handshake, decrypt application data, and handle
+    /// in-band control (auto-queuing any replies).
     pub fn process_new_packets(&mut self) -> Result<IoState, Error> {
-        while let Some(frame) = self.deframer.pop()? {
-            self.process_frame(frame)?;
+        while let Some(payload) = self.deframer.pop()? {
+            self.process_payload(payload)?;
         }
         Ok(IoState {
             tls_bytes_to_write: self.sendable_tls.len(),
@@ -232,145 +207,12 @@ impl ConnectionCommon {
         !self.sendable_tls.is_empty()
     }
 
-    /// True until the *initial* key agreement completes (ongoing rekeys are invisible here).
+    /// True until the initial key agreement completes.
     pub fn is_handshaking(&self) -> bool {
-        !self.handshake_done
+        self.state != HsState::Established
     }
 
-    // --- internals ---
-
-    fn process_frame(&mut self, frame: Frame) -> Result<(), Error> {
-        if frame.outer_type == ContentType::Handshake as u8 {
-            // Phase A: plaintext handshake frame.
-            let payload = HandshakePayload::decode(frame.body())?;
-            self.process_plaintext_handshake(payload)
-        } else if frame.outer_type == ContentType::ApplicationData as u8 {
-            // Phase B: encrypted record.
-            let record = self
-                .record
-                .as_mut()
-                .ok_or(Error::UnexpectedMessage("application data before handshake"))?;
-            let plaintext = record.decrypt(&frame.record)?;
-            self.process_decrypted(plaintext)
-        } else {
-            Err(Error::UnexpectedMessage("unexpected outer record type"))
-        }
-    }
-
-    fn process_plaintext_handshake(&mut self, payload: HandshakePayload) -> Result<(), Error> {
-        match payload {
-            HandshakePayload::ServerHello(welcome) => self.complete_client_handshake(welcome),
-            HandshakePayload::ResumptionResponse(commit) if self.resuming_client => {
-                self.complete_client_resume(commit)
-            }
-            _ => Err(Error::UnexpectedMessage(
-                "unexpected plaintext handshake message",
-            )),
-        }
-    }
-
-    fn complete_client_resume(&mut self, commit: MlsMessage) -> Result<(), Error> {
-        {
-            let group = self
-                .group
-                .as_mut()
-                .ok_or(Error::UnexpectedMessage("resume without group"))?;
-            let two_party = self
-                .two_party
-                .as_mut()
-                .ok_or(Error::UnexpectedMessage("resume without state"))?;
-            two_party.handle_resumption_response(group, ResumptionResponse { commit })?;
-        }
-        self.rebuild_record_layer()?;
-        self.group.as_mut().unwrap().write_to_storage()?;
-        self.handshake_done = true;
-        self.resuming_client = false;
-        Ok(())
-    }
-
-    fn complete_client_handshake(&mut self, welcome: MlsMessage) -> Result<(), Error> {
-        let ctx = self
-            .client_ctx
-            .take()
-            .ok_or(Error::UnexpectedMessage("unexpected ServerHello"))?;
-
-        let server_hello = ServerHello { welcome };
-        let mut group = initial_key_agreement_initiator_2(&ctx.client, server_hello)?;
-
-        // Manual, directional peer check: verify the *server's* credential from the joined group,
-        // threading the requested ServerName (the group's mls-rs provider is accept-all).
-        verify_server_credential(&group, &ctx.verifier, &ctx.server_name)?;
-
-        let record = create_record_layer(&group, Side::Client, RustCryptoProvider::default());
-        group.write_to_storage()?; // persist for resumption
-
-        self.group = Some(group);
-        self.record = Some(record);
-        self.two_party = Some(Mls2Party::new(Role::Initiator));
-        self.handshake_done = true;
-        Ok(())
-    }
-
-    fn process_decrypted(&mut self, plaintext: TlsPlaintext) -> Result<(), Error> {
-        match plaintext.content_type {
-            ContentType::ApplicationData => {
-                self.received_plaintext.extend(plaintext.fragment);
-                Ok(())
-            }
-            ContentType::Handshake => {
-                let payload = HandshakePayload::decode(&plaintext.fragment)?;
-                self.process_control(payload)
-            }
-            ContentType::Alert => {
-                self.peer_closed = true;
-                Ok(())
-            }
-            _ => Err(Error::UnexpectedMessage("unexpected inner content type")),
-        }
-    }
-
-    /// Explicitly initiate a rekey by sending a `ConnectionUpdate` (the analog of rustls'
-    /// `refresh_traffic_keys`). Inbound handling of the resulting control messages is automatic
-    /// inside [`process_new_packets`](Self::process_new_packets).
-    pub fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
-        let crypto = RustCryptoProvider::default();
-        let group = self
-            .group
-            .as_mut()
-            .ok_or(Error::UnexpectedMessage("rekey before handshake"))?;
-        let two_party = self
-            .two_party
-            .as_mut()
-            .ok_or(Error::UnexpectedMessage("rekey before handshake"))?;
-        if let Some((connection_update, rekey)) = two_party.create_connection_update(group, &crypto)?
-        {
-            self.emit_then_rekey(
-                HandshakePayload::ConnectionUpdate(connection_update.update),
-                rekey,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Explicitly initiate an in-session resumption (a full re-key-agreement over the live group via
-    /// a `ResumptionRequest`). Inbound handling of the response is automatic in
-    /// [`process_new_packets`](Self::process_new_packets).
-    pub fn initiate_resumption(&mut self) -> Result<(), Error> {
-        let group = self
-            .group
-            .as_mut()
-            .ok_or(Error::UnexpectedMessage("resume before handshake"))?;
-        let two_party = self
-            .two_party
-            .as_mut()
-            .ok_or(Error::UnexpectedMessage("resume before handshake"))?;
-        let request = two_party.create_resumption_request(group)?;
-        self.emit_then_rekey(HandshakePayload::ResumptionRequest(request.commit), None)?;
-        Ok(())
-    }
-
-    /// Snapshot the current group for later cross-connection resumption: persist it to the session
-    /// store and return a [`ResumptionState`] that names it.
+    /// Snapshot the current group for cross-connection resumption.
     pub fn export_resumption_state(&mut self) -> Result<ResumptionState, Error> {
         let group = self
             .group
@@ -382,132 +224,207 @@ impl ConnectionCommon {
         })
     }
 
-    /// In-band control handling (automatic): dispatch a decoded control message to the two-party
-    /// state machine, then emit any reply under the old key and rotate (emit-before-switch).
-    fn process_control(&mut self, payload: HandshakePayload) -> Result<(), Error> {
-        let crypto = RustCryptoProvider::default();
-        match payload {
-            HandshakePayload::ConnectionUpdate(update) => {
-                let group = self
-                    .group
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let two_party = self
-                    .two_party
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let (rekey, reply) =
-                    two_party.handle_connection_update(group, &crypto, ConnectionUpdate { update })?;
-                self.emit_reply_then_rekey(reply, rekey)
-            }
-            HandshakePayload::EpochKeyUpdate(epoch) => {
-                let group = self
-                    .group
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let two_party = self
-                    .two_party
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let (rekey, reply) = two_party.handle_epoch_key_update(
-                    group,
-                    &crypto,
-                    EpochKeyUpdate { epoch },
-                )?;
-                self.emit_reply_then_rekey(reply, rekey)
-            }
-            HandshakePayload::ResumptionRequest(commit) => {
-                // Responder handling an in-session resumption request.
-                let group = self
-                    .group
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let two_party = self
-                    .two_party
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let response =
-                    two_party.handle_resumption_request(group, ResumptionRequest { commit })?;
-                // The group is now at the resumed epoch. Emit the response under the OLD key first,
-                // then rebuild both record-layer directions for the new epoch.
-                if let Some(resp) = response {
-                    self.emit_then_rekey(HandshakePayload::ResumptionResponse(resp.commit), None)?;
-                }
-                self.rebuild_record_layer()
-            }
-            HandshakePayload::ResumptionResponse(commit) => {
-                // Initiator applying the resumption response.
-                let group = self
-                    .group
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                let two_party = self
-                    .two_party
-                    .as_mut()
-                    .ok_or(Error::UnexpectedMessage("control before handshake"))?;
-                two_party.handle_resumption_response(group, ResumptionResponse { commit })?;
-                self.rebuild_record_layer()
-            }
-            HandshakePayload::ClientHello(_) | HandshakePayload::ServerHello(_) => Err(
-                Error::UnexpectedMessage("unexpected hello message in steady state"),
-            ),
+    // --- handshake / control dispatch ---
+
+    fn process_payload(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        match self.state {
+            HsState::ClientAwaitingServerPubkey => self.client_on_server_pubkey(payload),
+            HsState::ClientAwaitingServerHello => self.client_on_server_hello(payload),
+            HsState::ServerAwaitingClientHello => self.server_on_client_hello(payload),
+            HsState::Established => self.on_established(payload),
         }
     }
 
-    /// Rebuild both record-layer directions from the group's current epoch (used after resumption,
-    /// which rotates the whole key schedule wholesale rather than one direction at a time).
-    fn rebuild_record_layer(&mut self) -> Result<(), Error> {
-        let side = self.side;
-        let group = self
-            .group
-            .as_ref()
-            .ok_or(Error::UnexpectedMessage("no group to rebuild record layer"))?;
-        self.record = Some(create_record_layer(group, side, RustCryptoProvider::default()));
+    fn client_on_server_pubkey(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        let ctx = self
+            .client_ctx
+            .as_mut()
+            .ok_or(Error::UnexpectedMessage("no client context"))?;
+        ctx.server_pubkey = Some(payload);
+        let bytes = Envelope::ClientHello(ctx.pending_client_hello.clone()).encode()?;
+        self.sendable_tls.extend(frame_transport(&bytes));
+        self.state = HsState::ClientAwaitingServerHello;
         Ok(())
     }
 
-    /// Emit an optional reply `EpochKeyUpdate` under the old key, then apply the rekey.
-    fn emit_reply_then_rekey(
-        &mut self,
-        reply: Option<EpochKeyUpdate>,
-        rekey: Option<DirectionalRekey>,
-    ) -> Result<(), Error> {
-        match reply {
-            Some(eku) => {
-                self.emit_then_rekey(HandshakePayload::EpochKeyUpdate(eku.epoch), rekey)
+    fn client_on_server_hello(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        let welcome = MlsMessage::from_bytes(&payload)?;
+        let ctx = self
+            .client_ctx
+            .take()
+            .ok_or(Error::UnexpectedMessage("unexpected ServerHello"))?;
+
+        let mut group =
+            initial_key_agreement_initiator_2(&ctx.client, ServerHello { welcome })?;
+
+        verify_server(&group, &ctx.verifier, &ctx.server_name, ctx.server_pubkey.as_deref())?;
+
+        let record = create_record_layer(&group, Side::Client);
+        group.write_to_storage()?;
+
+        self.group = Some(group);
+        self.record = Some(record);
+        self.two_party = Some(Mls2Party::new(Role::Initiator));
+        self.state = HsState::Established;
+        Ok(())
+    }
+
+    fn server_on_client_hello(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        let envelope = Envelope::decode(&payload)?;
+        let ctx = self
+            .server_ctx
+            .take()
+            .ok_or(Error::UnexpectedMessage("no server context"))?;
+
+        match envelope {
+            Envelope::ClientHello(key_package) => {
+                if let ClientCertVerifier::WebPki { .. } = ctx.client_verifier {
+                    return Err(Error::Unsupported("client certificate verification"));
+                }
+                let (server_hello, mut group) = initial_key_agreement_responder_1(
+                    ClientHello { key_package },
+                    ctx.signing_identity,
+                    ctx.signer,
+                    ctx.cipher_suite,
+                    ctx.storage,
+                )?;
+                let record = create_record_layer(&group, Side::Server);
+                group.write_to_storage()?;
+
+                // ServerHello is a bare MLSMessage(Welcome) — no envelope.
+                let welcome_bytes = server_hello.welcome.to_bytes()?;
+                self.sendable_tls.extend(frame_transport(&welcome_bytes));
+
+                self.group = Some(group);
+                self.record = Some(record);
+                self.two_party = Some(Mls2Party::new(Role::Responder));
+                self.state = HsState::Established;
+                Ok(())
             }
-            None => {
+            Envelope::Resumption(_) => {
+                Err(Error::Unsupported("resumption not yet wired to the new framing"))
+            }
+        }
+    }
+
+    fn on_established(&mut self, payload: Vec<u8>) -> Result<(), Error> {
+        if is_app_data(&payload) {
+            let record = self
+                .record
+                .as_mut()
+                .ok_or(Error::UnexpectedMessage("application data before handshake"))?;
+            let plaintext: TlsPlaintext = record.decrypt(&payload)?;
+            match plaintext.content_type {
+                ContentType::ApplicationData => {
+                    self.received_plaintext.extend(plaintext.fragment);
+                    Ok(())
+                }
+                ContentType::Alert => {
+                    self.peer_closed = true;
+                    Ok(())
+                }
+                _ => Err(Error::UnexpectedMessage("unexpected inner content type")),
+            }
+        } else {
+            let signaling = Signaling::decode(&payload)?;
+            self.process_signaling(signaling)
+        }
+    }
+
+    // --- explicit control ---
+
+    /// Explicitly initiate a rekey by sending a `ConnectionUpdate` (analog of rustls'
+    /// `refresh_traffic_keys`). Inbound handling of the resulting control is automatic.
+    pub fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
+        let crypto = MlsTlsCryptoProvider::new();
+        let group = self
+            .group
+            .as_mut()
+            .ok_or(Error::UnexpectedMessage("rekey before handshake"))?;
+        let two_party = self
+            .two_party
+            .as_mut()
+            .ok_or(Error::UnexpectedMessage("rekey before handshake"))?;
+        if let Some((connection_update, rekey)) =
+            two_party.create_connection_update(group, &crypto)?
+        {
+            self.send_signaling(Signaling::ConnectionUpdate {
+                update_requested: false,
+                commit: connection_update.update,
+            })?;
+            if let Some(rekey) = rekey {
+                self.apply_directional_rekey(rekey)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// In-band control handling (automatic).
+    fn process_signaling(&mut self, signaling: Signaling) -> Result<(), Error> {
+        let crypto = MlsTlsCryptoProvider::new();
+        match signaling {
+            Signaling::ConnectionUpdate { commit, .. } => {
+                let (rekey, reply) = {
+                    let group = self
+                        .group
+                        .as_mut()
+                        .ok_or(Error::UnexpectedMessage("control before handshake"))?;
+                    let two_party = self
+                        .two_party
+                        .as_mut()
+                        .ok_or(Error::UnexpectedMessage("control before handshake"))?;
+                    two_party.handle_connection_update(
+                        group,
+                        &crypto,
+                        ConnectionUpdate { update: commit },
+                    )?
+                };
+                if let Some(eku) = reply {
+                    self.send_signaling(Signaling::EpochKeyUpdate(eku.epoch))?;
+                }
                 if let Some(rekey) = rekey {
                     self.apply_directional_rekey(rekey)?;
                 }
                 Ok(())
             }
+            Signaling::EpochKeyUpdate(epoch) => {
+                let (rekey, reply) = {
+                    let group = self
+                        .group
+                        .as_mut()
+                        .ok_or(Error::UnexpectedMessage("control before handshake"))?;
+                    let two_party = self
+                        .two_party
+                        .as_mut()
+                        .ok_or(Error::UnexpectedMessage("control before handshake"))?;
+                    two_party.handle_epoch_key_update(group, &crypto, EpochKeyUpdate { epoch })?
+                };
+                if let Some(eku) = reply {
+                    self.send_signaling(Signaling::EpochKeyUpdate(eku.epoch))?;
+                }
+                if let Some(rekey) = rekey {
+                    self.apply_directional_rekey(rekey)?;
+                }
+                Ok(())
+            }
+            Signaling::ConnectionConfirmation(_) => Err(Error::Unsupported(
+                "resumption not yet wired to the new framing",
+            )),
         }
     }
 
-    /// Encrypt a control message under the CURRENT (old) send key into the outgoing buffer, *then*
-    /// rotate the record layer — the emit-before-switch invariant.
-    fn emit_then_rekey(
-        &mut self,
-        payload: HandshakePayload,
-        rekey: Option<DirectionalRekey>,
-    ) -> Result<(), Error> {
-        let bytes = payload.encode()?;
-        for r in self
-            .record_mut()?
-            .encrypt(ContentType::Handshake, &bytes)?
-        {
-            self.sendable_tls.extend(r);
-        }
-        if let Some(rekey) = rekey {
-            self.apply_directional_rekey(rekey)?;
-        }
+    fn send_signaling(&mut self, signaling: Signaling) -> Result<(), Error> {
+        let bytes = signaling.encode()?;
+        self.sendable_tls.extend(frame_transport(&bytes));
         Ok(())
     }
 
     fn apply_directional_rekey(&mut self, rekey: DirectionalRekey) -> Result<(), Error> {
         let side = self.side;
         self.record_mut()?.apply_rekey(rekey, side);
+        if let Some(group) = self.group.as_mut() {
+            group.write_to_storage().ok();
+        }
         Ok(())
     }
 
@@ -522,27 +439,36 @@ impl ConnectionCommon {
             .record
             .as_mut()
             .ok_or(Error::UnexpectedMessage("cannot send before handshake"))?;
-        for r in record.encrypt(ContentType::ApplicationData, data)? {
-            self.sendable_tls.extend(r);
+        for inner in record.encrypt(ContentType::ApplicationData, data)? {
+            self.sendable_tls.extend(frame_transport(&inner));
         }
         Ok(())
     }
 }
 
-/// Verify the server's credential per the configured policy (see [`ServerCertVerifier`]).
-fn verify_server_credential(
+/// Verify the server's credential per policy plus the pre-handshake public-key binding.
+fn verify_server(
     group: &MlsGroup,
     verifier: &ServerCertVerifier,
     server_name: &ServerName<'_>,
+    pre_handshake_pubkey: Option<&[u8]>,
 ) -> Result<(), Error> {
+    let member = group
+        .member_at_index(0)
+        .ok_or(Error::UnexpectedMessage("responder member missing"))?;
+    let signing_identity = member.signing_identity();
+
+    // Bind the joined group's responder key to the key the server presented pre-handshake.
+    if let Some(expected) = pre_handshake_pubkey
+        && signing_identity.signature_key.as_bytes() != expected
+    {
+        return Err(Error::PeerAuth("server key does not match presented key"));
+    }
+
     match verifier {
         ServerCertVerifier::None => Ok(()),
         ServerCertVerifier::WebPki { trust_anchors } => {
-            // The responder created the group, so it is leaf index 0 from the initiator's view.
-            let member = group
-                .member_at_index(0)
-                .ok_or(Error::UnexpectedMessage("responder member missing"))?;
-            validate_server_credential(member.signing_identity(), trust_anchors, Some(server_name))?;
+            validate_server_credential(signing_identity, trust_anchors, Some(server_name))?;
             Ok(())
         }
     }

@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use mls_tls::{Acceptor, ClientConfig, ClientConnection, ServerConfig, ServerName, StreamOwned};
+use mls_tls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, ServerName, StreamOwned};
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -20,19 +20,11 @@ fn main() {
             .with_generated_basic_credential(b"server")
             .unwrap();
 
-        let (mut sock, _) = listener.accept().unwrap();
+        let (sock, _) = listener.accept().unwrap();
 
-        // Read the ClientHello off the socket before committing to a config.
-        let mut acceptor = Acceptor::new();
-        let accepted = loop {
-            if acceptor.read_tls(&mut sock).unwrap() == 0 {
-                return; // connection closed
-            }
-            if let Some(accepted) = acceptor.accept().unwrap() {
-                break accepted;
-            }
-        };
-        let conn = accepted.into_connection(server_config).unwrap();
+        // The server speaks first (it sends its public key), so no Acceptor is needed: build the
+        // connection from the config and let StreamOwned drive the handshake on first I/O.
+        let conn = ServerConnection::new(server_config).unwrap();
 
         let mut tls = StreamOwned::new(conn, sock);
         let mut buf = [0u8; 256];

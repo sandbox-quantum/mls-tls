@@ -67,18 +67,20 @@ fn derive_key(
     Ok(secret)
 }
 
+// Traffic-secret labels match the Python `mls-tls-python-pedantic` reference exactly — note there
+// is NO space between "1.0" and "Initial" (`"MLS-TLS 1.0" + "Initial ... Traffic Secret"`).
 pub(crate) fn derive_server_application_traffic_secret(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,
 ) -> Result<Secret, MlsTlsError> {
-    derive_key(group, crypto_provider, b"MLS-TLS s ap traffic")
+    derive_key(group, crypto_provider, b"MLS-TLS 1.0Initial Server Traffic Secret")
 }
 
 pub(crate) fn derive_client_application_traffic_secret(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,
 ) -> Result<Secret, MlsTlsError> {
-    derive_key(group, crypto_provider, b"MLS-TLS c ap traffic")
+    derive_key(group, crypto_provider, b"MLS-TLS 1.0Initial Client Traffic Secret")
 }
 
 

@@ -3,44 +3,43 @@
 //!
 //! Run with: `cargo run --example loopback`
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use mls_tls::{
-    Acceptor, ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection,
+    ClientConfig, ClientConnection, ConnectionCommon, ServerConfig, ServerConnection, ServerName,
 };
 
-fn pump(conn: &mut ConnectionCommon) -> Vec<u8> {
-    let mut out = Vec::new();
-    while conn.wants_write() {
-        let before = out.len();
-        conn.write_tls(&mut out).unwrap();
-        if out.len() == before {
+/// Move all of `from`'s buffered TLS bytes into `to`, then process them. Returns bytes moved.
+fn pump(from: &mut ConnectionCommon, to: &mut ConnectionCommon) -> usize {
+    let mut buf = Vec::new();
+    while from.wants_write() {
+        if from.write_tls(&mut buf).unwrap() == 0 {
             break;
         }
     }
-    out
-}
-
-fn deliver(bytes: &[u8], to: &mut ConnectionCommon) {
-    if bytes.is_empty() {
-        return;
+    if buf.is_empty() {
+        return 0;
     }
-    to.read_tls(&mut Cursor::new(bytes)).unwrap();
+    let mut cur = &buf[..];
+    while !cur.is_empty() {
+        if to.read_tls(&mut cur).unwrap() == 0 {
+            break;
+        }
+    }
     to.process_new_packets().unwrap();
+    buf.len()
 }
 
 fn send(from: &mut ConnectionCommon, to: &mut ConnectionCommon, msg: &str) {
     from.writer().write_all(msg.as_bytes()).unwrap();
-    deliver(&pump(from), to);
+    pump(from, to);
     let mut buf = vec![0u8; msg.len()];
     let n = to.reader().read(&mut buf).unwrap();
     println!("  received: {:?}", String::from_utf8_lossy(&buf[..n]));
 }
 
 fn main() {
-    // Client: generated Basic credential, no server-cert verification (peer auth out of scope here).
-    // Server: generated Basic credential.
     let client_config: Arc<ClientConfig> = ClientConfig::builder()
         .with_no_certificate_verification()
         .with_generated_basic_credential(b"client")
@@ -50,24 +49,24 @@ fn main() {
         .with_generated_basic_credential(b"server")
         .unwrap();
 
-    let server_name = mls_tls::ServerName::try_from("localhost").unwrap();
+    let server_name = ServerName::try_from("localhost").unwrap();
     let mut client = ClientConnection::new(client_config, server_name).unwrap();
-    println!("handshake: client is_handshaking = {}", client.is_handshaking());
+    // The server speaks first (pre-handshake public key), so build it directly (no Acceptor).
+    let mut server = ServerConnection::new(server_config).unwrap();
 
-    // ClientHello -> server (via Acceptor).
-    let ch = pump(&mut client);
-    let mut acceptor = Acceptor::new();
-    acceptor.read_tls(&mut Cursor::new(&ch)).unwrap();
-    let accepted = acceptor.accept().unwrap().expect("ClientHello");
+    // Drive the handshake: server pubkey -> ClientHello -> ServerHello.
+    for _ in 0..8 {
+        let a = pump(&mut server, &mut client);
+        let b = pump(&mut client, &mut server);
+        if a == 0 && b == 0 {
+            break;
+        }
+    }
     println!(
-        "server saw offered cipher suite: {:?}",
-        accepted.client_hello().and_then(|h| h.cipher_suite())
+        "handshake done: client={}, server={}",
+        !client.is_handshaking(),
+        !server.is_handshaking()
     );
-    let mut server: ServerConnection = accepted.into_connection(server_config).unwrap();
-
-    // ServerHello -> client.
-    deliver(&pump(&mut server), &mut client);
-    println!("handshake: client is_handshaking = {}", client.is_handshaking());
 
     println!("client -> server:");
     send(&mut client, &mut server, "hello from client");
@@ -77,15 +76,12 @@ fn main() {
     // Explicit rekey initiated by the client; inbound handling is automatic.
     println!("client initiates rekey ...");
     client.refresh_traffic_keys().unwrap();
-    // settle the control exchange
-    loop {
-        let c2s = pump(&mut client);
-        let s2c = pump(&mut server);
-        if c2s.is_empty() && s2c.is_empty() {
+    for _ in 0..4 {
+        let a = pump(&mut client, &mut server);
+        let b = pump(&mut server, &mut client);
+        if a == 0 && b == 0 {
             break;
         }
-        deliver(&c2s, &mut server);
-        deliver(&s2c, &mut client);
     }
 
     println!("client -> server (post-rekey):");
