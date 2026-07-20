@@ -17,7 +17,7 @@
 // > Where MLS-Exporter is defined in [RFC9420] and Length is the size of the secret required by the TLS record layer.
 
 use mls_rs::{
-    CipherSuite, CipherSuiteProvider, CryptoProvider, Group, MlsMessage, client_builder::MlsConfig, crypto::Secret, error::MlsError,
+    CipherSuite, CipherSuiteProvider, CryptoProvider, Group, client_builder::MlsConfig, crypto::Secret, error::MlsError,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +38,6 @@ pub enum MlsTlsError {
 /// | 5  | DHKEMP521   | AES 256          | SHA 512          | P521             |
 /// | 6  | DHKEMX448   | ChaCha20Poly1305 | SHA 512          | Ed448            |
 /// | 7  | DHKEMP384   | AES 256          | SHA 512          | P384             |
-
 fn derive_key(
     group: &Group<impl MlsConfig>,
     crypto_provider: impl CryptoProvider,

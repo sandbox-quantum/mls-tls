@@ -1,3 +1,4 @@
+#![allow(dead_code)] // WebPkiIdentityProvider/PeerValidation retained for a future symmetric all-X.509 deployment (PUBLIC_API_DESIGN.md §3); peer auth is currently manual via validate_*_credential
 use std::{convert::Infallible, time::Duration};
 
 use mls_rs::{
@@ -80,7 +81,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<mls_rs::time::MlsTime>,
-        context: MemberValidationContext<'_>, // TODO: Need to check that properly
+        _context: MemberValidationContext<'_>, // TODO: Need to check that properly
     ) -> Result<(), Self::Error> {
         let chain = signing_identity
             .credential
@@ -99,7 +100,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
 
         let time = timestamp
             .map(|t| UnixTime::since_unix_epoch(Duration::from_secs(t.seconds_since_epoch())))
-            .unwrap_or_else(|| UnixTime::now());
+            .unwrap_or_else(UnixTime::now);
 
         ee_cert
             .verify_for_usage(

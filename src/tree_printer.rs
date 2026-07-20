@@ -1,3 +1,4 @@
+#![allow(dead_code)] // debug/inspection helpers, retained but not wired into the public API
 use mls_rs::{Group, client_builder::MlsConfig, group::Node};
 
 pub fn print_tree_detailed(group: &Group<impl MlsConfig>) {

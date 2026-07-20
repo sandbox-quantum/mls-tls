@@ -1,3 +1,4 @@
+#![allow(dead_code)] // some record-layer helpers are retained for completeness / test use
 // TLS 1.3 Record Layer (RFC 8446 §5)
 //
 

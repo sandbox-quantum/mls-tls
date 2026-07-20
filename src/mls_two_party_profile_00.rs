@@ -6,23 +6,19 @@ use mls_rs::{
     crypto::SignatureSecretKey,
     error::{IntoAnyError, MlsError},
     group::{
-        GroupContext, ReceivedMessage, Roster,
-        proposal::{Proposal, ProposalType},
+        GroupContext, Roster,
     },
     identity::SigningIdentity,
     mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
+    storage_provider::in_memory::InMemoryGroupStateStorage,
 };
-use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use rustls_pki_types::TrustAnchor;
 
 use crate::{
-    make_client,
+    mls_config::{MlsGroup, build_mls_client},
     mls_tls::MlsTlsError,
     mls_two_party_profile_00::State::{AwaitingEpochKeyUpdate, Synced},
-    print_tree,
     tls_record::DirectionalRekey,
-    tree_printer,
-    web_pki::{WebPkiIdentityError, validate_client_credential, validate_server_credential},
+    web_pki::{WebPkiIdentityError, validate_client_credential},
 };
 
 // draft-kohbrok-mls-two-party-profile-00
@@ -41,16 +37,16 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct ClientHello {
-    key_package: MlsMessage,
+    pub(crate) key_package: MlsMessage,
 }
 
 #[derive(Debug, Clone)]
 pub struct ServerHello {
-    welcome: MlsMessage,
+    pub(crate) welcome: MlsMessage,
 }
 
-pub(crate) fn initial_key_agreement_initiator_1(
-    initiator: &Client<impl MlsConfig>,
+pub(crate) fn initial_key_agreement_initiator_1<C: MlsConfig>(
+    initiator: &Client<C>,
 ) -> Result<ClientHello, MlsError> {
     // > The initiator starts the key agreement part of the protocol by
     // > creating a KeyPackage and sending a ClientHello to the responder.
@@ -71,7 +67,8 @@ pub(crate) fn initial_key_agreement_responder_1(
     signing_identity: SigningIdentity,
     signer: SignatureSecretKey,
     cipher_suite: CipherSuite,
-) -> Result<(ServerHello, Client<impl MlsConfig>, Group<impl MlsConfig>), TwoPartyError> {
+    group_state_storage: InMemoryGroupStateStorage,
+) -> Result<(ServerHello, MlsGroup), TwoPartyError> {
     // > The responder inspects the KeyPackage and checks whether it supports
     // > the offered ciphersuite and whether the initiator has sufficient
     // > capabilities to support the connection.
@@ -91,18 +88,17 @@ pub(crate) fn initial_key_agreement_responder_1(
 
     // > The responder MUST interface with the AS to ensure that the
     // > credential in the KeyPackage is valid.
+    //
+    // Directional peer check on the *client's* KeyPackage credential (the group's mls-rs identity
+    // provider is accept-all; real verification is manual — see `mls_config`). Accepts a Basic
+    // client credential today; the X.509 arm is a stub.
     validate_client_credential(initiator_key_package.signing_identity())?;
 
     // > The responder then locally creates an MLS group and commits to an Add
     // > proposal containing the initiator's KeyPackage.  The responder sends
     // > the resulting Welcome message back to the initiator as part of a
     // > ServerHello message.
-    let responder = make_client(
-        RustCryptoProvider::default(),
-        signing_identity,
-        signer,
-        cipher_suite,
-    )?;
+    let responder = build_mls_client(signing_identity, signer, cipher_suite, group_state_storage);
 
     let mut responder_group =
         responder.create_group(ExtensionList::default(), Default::default(), None)?;
@@ -115,49 +111,26 @@ pub(crate) fn initial_key_agreement_responder_1(
         .welcome_messages
         .into_iter()
         .next()
-        .ok_or(TwoPartyError::MissingWelcome)?; // There's something to do here about commit options (yes that's the thing about ratchet tree (see at the end of this file))
-    // commit options commitoptions
+        .ok_or(TwoPartyError::MissingWelcome)?;
     let server_hello = ServerHello { welcome };
     // IMPLEMENTOR NOTE: when is the commit actually applied? I assume the server can do it right away, but it would be good to make it explicit.
     responder_group.apply_pending_commit()?;
 
-    Ok((server_hello, responder, responder_group))
+    Ok((server_hello, responder_group))
 }
 
-pub(crate) fn initial_key_agreement_initiator_2(
-    initiator: &Client<impl MlsConfig>,
-    trust_anchors: &[TrustAnchor<'_>],
+/// Join the group from the responder's Welcome. Peer verification of the responder's credential is
+/// done by the *connection* layer (which holds the `ServerCertVerifier` policy + `ServerName`) —
+/// this function only builds the local group state.
+///
+/// Named-generic over `C` (not `impl MlsConfig`) so the concrete `MlsTlsConfig` flows through to the
+/// returned `Group<C>`, letting the connection own a nameable `MlsGroup`.
+pub(crate) fn initial_key_agreement_initiator_2<C: MlsConfig>(
+    initiator: &Client<C>,
     server_hello: ServerHello,
-) -> Result<Group<impl MlsConfig>, TwoPartyError> {
+) -> Result<Group<C>, TwoPartyError> {
     // > The initiator uses the Welcome to create its local group state.
     let (initiator_group, _) = initiator.join_group(None, &server_hello.welcome, None)?;
-
-    // > The initiator then inspects the group state and MUST interface with the
-    // > AS to ensure that the credential of the responder is valid.
-
-    // IMPLEMENTOR NOTE: 'inspects the use case' is too vague. What should the initiator inspect exactly?
-    // Only validating the credentials?
-    println!("server hello: {server_hello:?}");
-    print_tree(&initiator_group);
-    println!("\n\n\n");
-    tree_printer::print_tree(&initiator_group);
-
-    // IMPLEMENTOR NOTE: what is the identity. Should it be specified? How am I meant to find the identity of the server within the group?
-    // validator.validate(initiator_group.member_at_index(0).unwrap());
-    // This should at least be mentioned in the specs.
-    // It seems like leaf index is not necessarily stable?
-    //
-    // From the MLS RFC https://datatracker.ietf.org/doc/rfc9420/ [5.3.3.]
-    // Internally to the protocol, group members are uniquely identified by
-    // their leaf index.  However, a leaf index is only valid for referring
-    // to members in a given epoch.  The same leaf index may represent a
-    // different member, or no member at all, in a subsequent epoch.
-    let responder_member =
-        initiator_group
-            .member_at_index(0)
-            .ok_or(TwoPartyError::MissingMember)?;
-    validate_server_credential(responder_member.signing_identity(), trust_anchors, None)?;
-
     Ok(initiator_group)
 }
 
@@ -174,12 +147,12 @@ pub(crate) fn initial_key_agreement_initiator_2(
 // IMPLEMENTOR'S NOTE: here we're missing 'Unless it's an initiator that is waiting for an epoch key update)
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionUpdate {
-    update: MlsMessage,
+    pub(crate) update: MlsMessage,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EpochKeyUpdate {
-    epoch: u64,
+    pub(crate) epoch: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -487,19 +460,12 @@ impl IntoAnyError for TwoPartyRulesError {
 }
 
 #[derive(Clone)]
+#[derive(Default)]
 pub struct TwoPartyMlsRules {
     commit_options: CommitOptions,
     encryption_options: EncryptionOptions,
 }
 
-impl Default for TwoPartyMlsRules {
-    fn default() -> Self {
-        Self {
-            commit_options: CommitOptions::default(),
-            encryption_options: EncryptionOptions::default(),
-        }
-    }
-}
 
 impl mls_rs::MlsRules for TwoPartyMlsRules {
     type Error = TwoPartyRulesError;
@@ -528,7 +494,7 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
         _context: &GroupContext,
         _proposals: &ProposalBundle,
     ) -> Result<CommitOptions, Self::Error> {
-        Ok(self.commit_options.clone())
+        Ok(self.commit_options)
     }
 
     fn encryption_options(
@@ -536,7 +502,7 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
         _roster: &Roster<'_>,
         _context: &GroupContext,
     ) -> Result<EncryptionOptions, Self::Error> {
-        Ok(self.encryption_options.clone())
+        Ok(self.encryption_options)
     }
 }
 
