@@ -6,9 +6,21 @@
   "enabledManagers": ["github-actions"],
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",
+  // NEVER downgrade. Renovate only ever proposes versions ABOVE the installed one; the sole
+  // mechanism that can move a dependency backwards is rollback PRs — keep them OFF so a CVE
+  // remediation can never roll a package back to a lower version.
+  "rollbackPrs": false,
   "reviewersFromCodeOwners": true,
   "osvVulnerabilityAlerts": true,
-  "vulnerabilityAlerts": { "enabled": true, "labels": ["security"] },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"],
+    // Upgrade to the LOWEST released version that resolves the advisory (minimum viable fix) —
+    // smallest, easiest-to-verify change, not a jump to latest. This is chosen from Renovate's
+    // upgrade-only candidate set, so combined with rollbackPrs:false a fix can never land at or
+    // below the currently-installed version.
+    "vulnerabilityFixStrategy": "lowest"
+  },
   "labels": ["renovate", "dependencies", "security"],
   "branchPrefix": "renovate/",
   "packageRules": [
