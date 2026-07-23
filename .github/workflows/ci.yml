@@ -1,0 +1,32 @@
+name: CI
+# Minimal validating CI for mls-tls (Rust/cargo). The repo had no build/test CI.
+# Compiles all targets (lib, examples, and tests) to validate the build; the
+# interop/KAT test suites depend on generated fixtures, so they are not run here.
+# Lint/format are non-blocking. No Cargo.lock is committed, so builds are unlocked.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: cargo build (all targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Build (all targets)
+        run: cargo build --all-targets
+
+      - name: Clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+      - name: Format check (non-blocking)
+        continue-on-error: true
+        run: cargo fmt --check
