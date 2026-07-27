@@ -277,6 +277,38 @@ mod tests {
         assert_eq!(send(&mut server, &mut client, b"post s2c"), b"post s2c");
     }
 
+    /// A rekey costs no round trip: application data may be written straight after
+    /// `refresh_traffic_keys`, riding in the same flight as the `ConnectionUpdate`, and the reply
+    /// rides back with the `EpochKeyUpdate`.
+    ///
+    /// The initiator installs its new send key before the update is emitted, and the responder
+    /// installs both directions while processing it, so the record that follows in the same buffer
+    /// decrypts under the new epoch. This is the same shape as a TLS 1.3 `key_update`, which also
+    /// never blocks application data — and it is what makes the `key-update` scenario in
+    /// `benches/ttfb` a two-flight measurement. Contrast `loopback_initiator_rekey`, which lets the
+    /// exchange settle first.
+    #[test]
+    fn loopback_rekey_piggyback() {
+        let (mut client, mut server) = established_pair();
+        assert_eq!(send(&mut client, &mut server, b"pre"), b"pre");
+
+        client.refresh_traffic_keys().unwrap();
+        client.writer().write_all(b"c2s piggybacked").unwrap();
+
+        // One flight out: ConnectionUpdate followed by the record, decrypted in the same pass.
+        assert!(pump(&mut client, &mut server) > 0);
+        let mut buf = [0u8; 64];
+        let n = server.reader().read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"c2s piggybacked");
+
+        // One flight back: EpochKeyUpdate followed by the reply. Processing the former rotates the
+        // client's receive key in time for the latter.
+        server.writer().write_all(b"s2c piggybacked").unwrap();
+        assert!(pump(&mut server, &mut client) > 0);
+        let n = client.reader().read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"s2c piggybacked");
+    }
+
     #[test]
     fn loopback_resumption() {
         init();
@@ -333,6 +365,59 @@ mod tests {
             send(&mut server2, &mut client2, b"epoch2 back"),
             b"epoch2 back"
         );
+    }
+
+    /// A resumption costs no round trip either: the client may write before the
+    /// `ConnectionConfirmation` arrives, so the request rides in the same flight as the Resumption.
+    ///
+    /// `ClientConnection::resume` has already merged the self-update commit and built the record
+    /// layer at the new epoch by the time it returns, and encryption is gated on the record layer
+    /// alone rather than on the handshake state. The responder installs its side while processing
+    /// the Resumption, so a record following it in the same buffer decrypts immediately. This is the
+    /// analogue of TLS 1.3 early data, and it is what makes the `resumption` scenario in
+    /// `benches/ttfb` a two-flight measurement rather than four.
+    ///
+    /// Note the blocking adapters cannot express this: `Stream::complete_io` waits out
+    /// `is_handshaking()` before writing.
+    #[test]
+    fn loopback_resumption_early_data() {
+        init();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_generated_basic_credential(b"server")
+            .unwrap();
+        let client_config = ClientConfig::builder()
+            .with_no_certificate_verification()
+            .with_generated_basic_credential(b"client")
+            .unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+
+        let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
+        let mut client1 = ClientConnection::new(client_config.clone(), name.clone()).unwrap();
+        drive(&mut client1, &mut server1);
+        assert!(!client1.is_handshaking());
+        let resumption = client1.export_resumption_state().unwrap();
+
+        let mut server2 = ServerConnection::new(server_config).unwrap();
+        let mut client2 = ClientConnection::resume(client_config, name, resumption).unwrap();
+        assert!(
+            client2.is_handshaking(),
+            "the resuming client should still be awaiting the ConnectionConfirmation"
+        );
+        client2.writer().write_all(b"early data").unwrap();
+
+        // One flight out: Resumption followed by the record.
+        assert!(pump(&mut client2, &mut server2) > 0);
+        let mut buf = [0u8; 64];
+        let n = server2.reader().read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"early data");
+
+        // One flight back: ConnectionConfirmation followed by the reply.
+        server2.writer().write_all(b"reply").unwrap();
+        assert!(pump(&mut server2, &mut client2) > 0);
+        assert!(!client2.is_handshaking());
+        let n = client2.reader().read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"reply");
     }
 
     /// A Resumption naming a group the responder has never seen is refused: the server cannot
