@@ -1,10 +1,9 @@
 //! The sans-I/O connection core.
 //!
 //! Everything rides outer transport frames (content type `0x17`). The message sequence is:
-//! 1. server → client: the server's raw signing public key (pre-handshake);
-//! 2. client → server: ClientHello (`MlsTlsHandshake` envelope wrapping `MLSMessage(KeyPackage)`);
-//! 3. server → client: ServerHello (a bare `MLSMessage(Welcome)`);
-//! 4. both: application data (inner AEAD records) and plaintext `SignalingMessage`s (rekeys).
+//! 1. client → server: ClientHello (`MlsTlsHandshake` envelope wrapping `MLSMessage(KeyPackage)`);
+//! 2. server → client: ServerHello (a bare `MLSMessage(Welcome)`);
+//! 3. both: application data (inner AEAD records) and plaintext `SignalingMessage`s (rekeys).
 //!
 //! The public byte pipeline is rustls-shaped: [`read_tls`]/[`write_tls`]/[`process_new_packets`]/
 //! [`reader`]/[`writer`]. Sending a rekey is explicit ([`refresh_traffic_keys`]); handling inbound
@@ -57,13 +56,11 @@ pub struct IoState {
 /// Handshake progress of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HsState {
-    /// Client: waiting for the server's pre-handshake public key.
-    ClientAwaitingServerPubkey,
     /// Client: sent ClientHello, waiting for the ServerHello (Welcome).
     ClientAwaitingServerHello,
     /// Client (resumption): sent the Resumption, waiting for the ConnectionConfirmation.
     ClientAwaitingConfirmation,
-    /// Server: sent its public key, waiting for the ClientHello.
+    /// Server: waiting for the ClientHello.
     ServerAwaitingClientHello,
     /// The initial key agreement is complete.
     Established,
@@ -71,13 +68,9 @@ enum HsState {
 
 /// Client handshake context, retained until the handshake completes.
 pub(crate) struct ClientCtx {
-    pub(crate) client: Option<MlsClient>,
+    pub(crate) client: MlsClient,
     pub(crate) verifier: ServerCertVerifier,
     pub(crate) server_name: ServerName<'static>,
-    /// The ClientHello (KeyPackage) to send once the server pubkey arrives.
-    pub(crate) pending_client_hello: MlsMessage,
-    /// The server's pre-handshake signing public key, once received.
-    pub(crate) server_pubkey: Option<Vec<u8>>,
 }
 
 /// Server handshake context, retained until the ClientHello is processed.
@@ -102,44 +95,43 @@ pub struct ConnectionCommon {
     received_plaintext: VecDeque<u8>,
     sendable_tls: VecDeque<u8>,
     peer_closed: bool,
-    /// For a resuming client: the self-update commit to send in the Resumption message.
-    resumption_commit: Option<MlsMessage>,
 }
 
 impl ConnectionCommon {
-    /// Construct a fresh client core. It waits for the server's pre-handshake public key before
-    /// sending its ClientHello.
+    /// Construct a fresh client core: queue the ClientHello and await the ServerHello.
     pub(crate) fn new_client(
         client: MlsClient,
         verifier: ServerCertVerifier,
         server_name: ServerName<'static>,
         client_hello_kp: MlsMessage,
     ) -> Result<Self, Error> {
+        let mut sendable_tls = VecDeque::new();
+        sendable_tls.extend(frame_transport(
+            &Envelope::ClientHello(client_hello_kp).encode()?,
+        ));
         Ok(Self {
             side: Side::Client,
-            state: HsState::ClientAwaitingServerPubkey,
+            state: HsState::ClientAwaitingServerHello,
             group: None,
             record: None,
             two_party: None,
             client_ctx: Some(ClientCtx {
-                client: Some(client),
+                client,
                 verifier,
                 server_name,
-                pending_client_hello: client_hello_kp,
-                server_pubkey: None,
             }),
             server_ctx: None,
             deframer: MessageDeframer::new(),
             received_plaintext: VecDeque::new(),
-            sendable_tls: VecDeque::new(),
+            sendable_tls,
             peer_closed: false,
-            resumption_commit: None,
         })
     }
 
     /// Construct a resuming client core: the group is already reloaded and advanced (its self-update
-    /// commit merged), and the record layer built at the new epoch. It waits for the server pubkey,
-    /// sends the Resumption, then awaits the `ConnectionConfirmation`.
+    /// commit merged), and the record layer built at the new epoch. The responder credential
+    /// persisted in the group is checked against `verifier` before the Resumption is queued; the
+    /// connection then awaits the `ConnectionConfirmation`.
     pub(crate) fn new_client_resuming(
         group: MlsGroup,
         record: RecordLayer,
@@ -148,37 +140,30 @@ impl ConnectionCommon {
         server_name: ServerName<'static>,
         request_commit: MlsMessage,
     ) -> Result<Self, Error> {
+        verify_server(&group, &verifier, &server_name)?;
+
+        let mut sendable_tls = VecDeque::new();
+        sendable_tls.extend(frame_transport(
+            &Envelope::Resumption(request_commit).encode()?,
+        ));
         Ok(Self {
             side: Side::Client,
-            state: HsState::ClientAwaitingServerPubkey,
+            state: HsState::ClientAwaitingConfirmation,
             group: Some(group),
             record: Some(record),
             two_party: Some(two_party),
-            client_ctx: Some(ClientCtx {
-                client: None,
-                verifier,
-                server_name,
-                pending_client_hello: request_commit.clone(),
-                server_pubkey: None,
-            }),
+            // The confirmation carries only an epoch — no client context is needed to check it.
+            client_ctx: None,
             server_ctx: None,
             deframer: MessageDeframer::new(),
             received_plaintext: VecDeque::new(),
-            sendable_tls: VecDeque::new(),
+            sendable_tls,
             peer_closed: false,
-            resumption_commit: Some(request_commit),
         })
     }
 
-    /// Construct a server core: queue the server's public key and await the ClientHello.
+    /// Construct a server core: await the ClientHello. Nothing is queued until it arrives.
     pub(crate) fn new_server(server_ctx: ServerCtx) -> Result<Self, Error> {
-        let pubkey = server_ctx
-            .signing_identity
-            .signature_key
-            .as_bytes()
-            .to_vec();
-        let mut sendable_tls = VecDeque::new();
-        sendable_tls.extend(frame_transport(&pubkey));
         Ok(Self {
             side: Side::Server,
             state: HsState::ServerAwaitingClientHello,
@@ -189,9 +174,8 @@ impl ConnectionCommon {
             server_ctx: Some(server_ctx),
             deframer: MessageDeframer::new(),
             received_plaintext: VecDeque::new(),
-            sendable_tls,
+            sendable_tls: VecDeque::new(),
             peer_closed: false,
-            resumption_commit: None,
         })
     }
 
@@ -271,42 +255,11 @@ impl ConnectionCommon {
 
     fn process_payload(&mut self, payload: Vec<u8>) -> Result<(), Error> {
         match self.state {
-            HsState::ClientAwaitingServerPubkey => self.client_on_server_pubkey(payload),
             HsState::ClientAwaitingServerHello => self.client_on_server_hello(payload),
             HsState::ClientAwaitingConfirmation => self.client_on_confirmation(payload),
             HsState::ServerAwaitingClientHello => self.server_on_client_hello(payload),
             HsState::Established => self.on_established(payload),
         }
-    }
-
-    fn client_on_server_pubkey(&mut self, payload: Vec<u8>) -> Result<(), Error> {
-        let ctx = self
-            .client_ctx
-            .as_mut()
-            .ok_or(Error::UnexpectedMessage("no client context"))?;
-        ctx.server_pubkey = Some(payload);
-
-        if let Some(commit) = self.resumption_commit.take() {
-            let group = self
-                .group
-                .as_ref()
-                .ok_or(Error::UnexpectedMessage("resume without group"))?;
-            verify_server(
-                group,
-                &ctx.verifier,
-                &ctx.server_name,
-                ctx.server_pubkey.as_deref(),
-            )?;
-            // Resumption: send a Resumption envelope instead of a ClientHello.
-            let bytes = Envelope::Resumption(commit).encode()?;
-            self.sendable_tls.extend(frame_transport(&bytes));
-            self.state = HsState::ClientAwaitingConfirmation;
-        } else {
-            let bytes = Envelope::ClientHello(ctx.pending_client_hello.clone()).encode()?;
-            self.sendable_tls.extend(frame_transport(&bytes));
-            self.state = HsState::ClientAwaitingServerHello;
-        }
-        Ok(())
     }
 
     fn client_on_confirmation(&mut self, payload: Vec<u8>) -> Result<(), Error> {
@@ -335,17 +288,9 @@ impl ConnectionCommon {
             .take()
             .ok_or(Error::UnexpectedMessage("unexpected ServerHello"))?;
 
-        let client = ctx.client.as_ref().ok_or(Error::UnexpectedMessage(
-            "ServerHello without client context",
-        ))?;
-        let mut group = initial_key_agreement_initiator_2(client, ServerHello { welcome })?;
+        let mut group = initial_key_agreement_initiator_2(&ctx.client, ServerHello { welcome })?;
 
-        verify_server(
-            &group,
-            &ctx.verifier,
-            &ctx.server_name,
-            ctx.server_pubkey.as_deref(),
-        )?;
+        verify_server(&group, &ctx.verifier, &ctx.server_name)?;
 
         let record = create_record_layer(&group, Side::Client)?;
         group.write_to_storage()?;
@@ -557,24 +502,16 @@ impl ConnectionCommon {
     }
 }
 
-/// Verify the server's credential per policy plus the pre-handshake public-key binding.
+/// Verify the responder's credential from the group per the client's policy.
 fn verify_server(
     group: &MlsGroup,
     verifier: &ServerCertVerifier,
     server_name: &ServerName<'_>,
-    pre_handshake_pubkey: Option<&[u8]>,
 ) -> Result<(), Error> {
     let member = group
         .member_at_index(0)
         .ok_or(Error::UnexpectedMessage("responder member missing"))?;
     let signing_identity = member.signing_identity();
-
-    // Bind the joined group's responder key to the key the server presented pre-handshake.
-    if let Some(expected) = pre_handshake_pubkey
-        && signing_identity.signature_key.as_bytes() != expected
-    {
-        return Err(Error::PeerAuth("server key does not match presented key"));
-    }
 
     match verifier {
         ServerCertVerifier::None => Ok(()),

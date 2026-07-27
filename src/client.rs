@@ -33,9 +33,9 @@ use crate::tls_record::Role as Side;
 /// (`0x004e`); under `openssl` (which has no X-Wing) it is `P384_AES256`.
 /// Any suite the backend supports can be selected via `with_cipher_suite`.
 #[cfg(feature = "rustcrypto")]
-pub(crate) const CIPHER_SUITE: CipherSuite = crate::crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
+pub const DEFAULT_CIPHER_SUITE: CipherSuite = crate::crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
 #[cfg(feature = "openssl")]
-pub(crate) const CIPHER_SUITE: CipherSuite = CipherSuite::P384_AES256;
+pub const DEFAULT_CIPHER_SUITE: CipherSuite = CipherSuite::P384_AES256;
 
 /// How the client verifies the **server's** credential.
 ///
@@ -126,7 +126,7 @@ impl WantsClientCredential {
         Self {
             verifier,
             session_store: InMemoryGroupStateStorage::default(),
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: DEFAULT_CIPHER_SUITE,
         }
     }
 }
@@ -183,7 +183,25 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
 
 /// Generate a signature keypair for `cipher_suite` using the compiled crypto backend. Returns
 /// `Error::Unsupported` if the backend does not support the suite (e.g. X-Wing under `openssl`).
-pub(crate) fn generate_signature_key(
+///
+/// Use this to mint the credential passed to `with_server_credential` / `with_client_credential`
+/// when you need to keep the keypair (the `with_generated_basic_credential` shortcuts keep it
+/// internal):
+///
+/// ```no_run
+/// use mls_tls::{BasicCredential, DEFAULT_CIPHER_SUITE, ServerConfig, SigningIdentity};
+///
+/// let (signer, public) = mls_tls::generate_signature_key(DEFAULT_CIPHER_SUITE)?;
+/// let identity = SigningIdentity::new(
+///     BasicCredential::new(b"server".to_vec()).into_credential(),
+///     public,
+/// );
+/// let config = ServerConfig::builder()
+///     .with_no_client_auth()
+///     .with_server_credential(identity, signer);
+/// # Ok::<(), mls_tls::Error>(())
+/// ```
+pub fn generate_signature_key(
     cipher_suite: CipherSuite,
 ) -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
     // The earliest point at which a caller touches cryptography — before any connection exists.
@@ -242,8 +260,8 @@ impl ClientConnection {
 
         // Reload the persisted group, create + merge a self-update commit (advancing to the new
         // epoch), and build the fresh record layer. The connection then sends a Resumption and awaits
-        // the server's ConnectionConfirmation. The fresh server pre-handshake key is checked against
-        // the responder identity persisted in the group before the Resumption is sent.
+        // the server's ConnectionConfirmation. The responder credential persisted in the group is
+        // checked against `config.verifier` before the Resumption is sent.
         let client = build_mls_client(
             config.signing_identity.clone(),
             config.signer.clone(),

@@ -1,13 +1,16 @@
 //! A minimal blocking MLS-TLS client for interop testing against the Python `e2e_server.py`.
 //!
-//! Speaks the Python wire protocol via the public `mls-tls` API: receives the server's signing
-//! public key, sends the ClientHello, receives the ServerHello (Welcome), then exchanges one
-//! application-data message. Usage: `simple_client <port>`.
+//! Drives the protocol through the public `mls-tls` API — ClientHello, ServerHello (Welcome), then
+//! one application-data message each way — plus the Python peer's non-standard opening frame, which
+//! is consumed here rather than by the library (see [`interop`]). Usage: `simple_client <port>`.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 use mls_tls::{ClientConfig, ClientConnection, ConnectionCommon, ServerName};
+
+#[path = "interop/mod.rs"]
+mod interop;
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -51,6 +54,9 @@ fn main() -> io::Result<()> {
 
     let mut sock = TcpStream::connect(("127.0.0.1", port))?;
     sock.set_nodelay(true).ok();
+
+    // Python-only opening frame; the library's handshake starts with our ClientHello.
+    interop::recv_server_pubkey(&mut sock)?;
 
     let config = ClientConfig::builder()
         .with_no_certificate_verification()

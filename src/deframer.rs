@@ -7,9 +7,6 @@
 //!   [`RecordLayer`](crate::tls_record::RecordLayer);
 //! - otherwise → a plaintext control message: an [`Envelope`] (`MlsTlsHandshake`, first bytes
 //!   `0x0000`) during the handshake/resumption, or a [`Signaling`] message (`0x00xx`) in steady state.
-//!
-//! Pre-handshake, the server also sends its raw signing public key as a bare payload (first byte
-//! `0x04`, SEC1 uncompressed).
 
 use mls_rs::MlsMessage;
 

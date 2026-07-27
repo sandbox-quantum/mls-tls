@@ -16,7 +16,7 @@ use mls_rs::{
 use rustls_pki_types::CertificateDer;
 
 use crate::builder::ConfigBuilder;
-use crate::client::{CIPHER_SUITE, generate_signature_key};
+use crate::client::{DEFAULT_CIPHER_SUITE, generate_signature_key};
 use crate::conn::{ConnectionCommon, ServerCtx};
 use crate::error::Error;
 
@@ -80,7 +80,7 @@ impl WantsServerCredential {
         Self {
             client_verifier,
             session_store: InMemoryGroupStateStorage::default(),
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: DEFAULT_CIPHER_SUITE,
         }
     }
 }
@@ -158,8 +158,9 @@ pub struct ServerConnection {
 }
 
 impl ServerConnection {
-    /// Start a server connection. It queues the server's public key immediately; drive the handshake
-    /// by pumping `write_tls` / `read_tls` + `process_new_packets` until `is_handshaking()` is false.
+    /// Start a server connection. It queues nothing until the client's ClientHello arrives; drive the
+    /// handshake by pumping `read_tls` + `process_new_packets` / `write_tls` until `is_handshaking()`
+    /// is false.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
         #[cfg(feature = "fips")]
         crate::fips::assert_enabled()?;

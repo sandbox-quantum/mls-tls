@@ -37,10 +37,6 @@ pub enum Error {
     #[error("peer identity rejected")]
     Identity(#[from] PkiError),
 
-    /// Peer authentication failed (e.g. the joined group's key did not match the presented one).
-    #[error("peer authentication failed: {0}")]
-    PeerAuth(&'static str),
-
     /// A wire frame could not be parsed.
     #[error("malformed wire message: {0}")]
     Decode(&'static str),

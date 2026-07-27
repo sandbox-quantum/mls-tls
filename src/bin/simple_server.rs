@@ -1,13 +1,19 @@
 //! A minimal blocking MLS-TLS server for interop testing against the Python `e2e_client.py`.
 //!
-//! Speaks the Python wire protocol via the public `mls-tls` API: sends its signing public key,
-//! receives the ClientHello, sends the ServerHello (Welcome), then exchanges one application-data
-//! message. Usage: `simple_server <port>`.
+//! Drives the protocol through the public `mls-tls` API — ClientHello, ServerHello (Welcome), then
+//! one application-data message each way — plus the Python peer's non-standard opening frame, which
+//! is emitted here rather than by the library (see [`interop`]). Usage: `simple_server <port>`.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use mls_tls::{ConnectionCommon, ServerConfig, ServerConnection};
+use mls_tls::{
+    BasicCredential, ConnectionCommon, DEFAULT_CIPHER_SUITE, ServerConfig, ServerConnection,
+    SigningIdentity, generate_signature_key,
+};
+
+#[path = "interop/mod.rs"]
+mod interop;
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -54,15 +60,24 @@ fn main() -> io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("listening {port}");
 
+    // Keep the keypair rather than using `with_generated_basic_credential`: the Python peer expects
+    // the public half in the opening frame below.
+    let (signer, public) = generate_signature_key(DEFAULT_CIPHER_SUITE).map_err(to_io)?;
+    let identity = SigningIdentity::new(
+        BasicCredential::new(b"server".to_vec()).into_credential(),
+        public.clone(),
+    );
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_server_credential(identity, signer);
+
     let (mut sock, _) = listener.accept()?;
     sock.set_nodelay(true).ok();
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_generated_basic_credential(b"server")
-        .map_err(to_io)?;
-    let mut server = ServerConnection::new(config).map_err(to_io)?;
+    // Python-only opening frame; the library's handshake starts with the peer's ClientHello.
+    interop::send_server_pubkey(&mut sock, &public)?;
 
+    let mut server = ServerConnection::new(config).map_err(to_io)?;
     complete_handshake(&mut server, &mut sock)?;
 
     // Application-data exchange (epoch 1): receive one, send one back.

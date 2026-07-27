@@ -67,7 +67,10 @@ mod stream;
 
 // --- public API surface ---
 pub use builder::ConfigBuilder;
-pub use client::{ClientConfig, ClientConnection, ServerCertVerifier};
+pub use client::{
+    ClientConfig, ClientConnection, DEFAULT_CIPHER_SUITE, ServerCertVerifier,
+    generate_signature_key,
+};
 pub use conn::{Connection, ConnectionCommon, IoState, Reader, Writer};
 pub use crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
 pub use error::Error;
@@ -79,6 +82,7 @@ pub use stream::{Stream, StreamOwned};
 pub use mls_rs::CipherSuite;
 pub use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
 pub use mls_rs::identity::SigningIdentity;
+pub use mls_rs::identity::basic::BasicCredential;
 pub use mls_rs::identity::x509::CertificateChain;
 pub use rustls_pki_types::{CertificateDer, ServerName};
 pub use tls_record::Role as Side;
@@ -331,14 +335,11 @@ mod tests {
         );
     }
 
+    /// A Resumption naming a group the responder has never seen is refused: the server cannot
+    /// reload it, so no keys are installed and the connection never establishes.
     #[test]
-    fn resumption_rejects_changed_server_identity() {
+    fn resumption_rejects_unknown_group() {
         init();
-        use crate::client::{ClientConfig, generate_signature_key};
-        use crate::server::{ServerConfig, ServerConnection};
-        use mls_rs::identity::{SigningIdentity, basic::BasicCredential};
-        use std::sync::Arc;
-
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_generated_basic_credential(b"server")
@@ -349,45 +350,39 @@ mod tests {
             .unwrap();
         let name = ServerName::try_from("localhost").unwrap();
 
-        let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
+        let mut server1 = ServerConnection::new(server_config).unwrap();
         let mut client1 = ClientConnection::new(client_config.clone(), name.clone()).unwrap();
         drive(&mut client1, &mut server1);
         assert!(!client1.is_handshaking());
         let resumption = client1.export_resumption_state().unwrap();
 
-        let (bad_signer, bad_public) = generate_signature_key(server_config.cipher_suite).unwrap();
-        let bad_identity = SigningIdentity::new(
-            BasicCredential::new(b"other-server".to_vec()).into_credential(),
-            bad_public,
-        );
-        let bad_server_config = Arc::new(crate::server::ServerConfig {
-            client_verifier: server_config.client_verifier.clone(),
-            signing_identity: bad_identity,
-            signer: bad_signer,
-            cipher_suite: server_config.cipher_suite,
-            group_state_storage: server_config.group_state_storage.clone(),
-        });
-
-        let mut server2 = ServerConnection::new(bad_server_config).unwrap();
+        // A second server built from a *fresh* config: its session store never saw the group.
+        let other_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_generated_basic_credential(b"server")
+            .unwrap();
+        let mut server2 = ServerConnection::new(other_config).unwrap();
         let mut client2 = ClientConnection::resume(client_config, name, resumption).unwrap();
 
+        // Deliver the Resumption without processing it, so the failure can be inspected directly.
         let mut buf = Vec::new();
-        while server2.wants_write() {
-            if server2.write_tls(&mut buf).unwrap() == 0 {
+        while client2.wants_write() {
+            if client2.write_tls(&mut buf).unwrap() == 0 {
                 break;
             }
         }
         let mut incoming = &buf[..];
         while !incoming.is_empty() {
-            if client2.read_tls(&mut incoming).unwrap() == 0 {
+            if server2.read_tls(&mut incoming).unwrap() == 0 {
                 break;
             }
         }
 
         assert!(matches!(
-            client2.process_new_packets().unwrap_err(),
-            crate::error::Error::PeerAuth("server key does not match presented key")
+            server2.process_new_packets().unwrap_err(),
+            crate::error::Error::Mls(_)
         ));
-        assert!(!client2.wants_write());
+        assert!(server2.is_handshaking());
+        assert!(!server2.wants_write());
     }
 }

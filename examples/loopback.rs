@@ -56,13 +56,12 @@ fn main() {
 
     let server_name = ServerName::try_from("localhost").unwrap();
     let mut client = ClientConnection::new(client_config, server_name).unwrap();
-    // The server speaks first (pre-handshake public key), so build it directly (no Acceptor).
     let mut server = ServerConnection::new(server_config).unwrap();
 
-    // Drive the handshake: server pubkey -> ClientHello -> ServerHello.
+    // Drive the handshake: ClientHello -> ServerHello.
     for _ in 0..8 {
-        let a = pump(&mut server, &mut client);
-        let b = pump(&mut client, &mut server);
+        let a = pump(&mut client, &mut server);
+        let b = pump(&mut server, &mut client);
         if a == 0 && b == 0 {
             break;
         }

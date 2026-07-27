@@ -2,13 +2,20 @@
 //! one Arc-backed session store): the first is a fresh handshake, the second resumes it. Each
 //! connection receives one app-data message and replies with an ack.
 //!
-//! Usage: `resume_server <port>`.
+//! The Python peer expects a non-standard public-key frame at the head of each connection; it is
+//! emitted here rather than by the library (see [`interop`]). Usage: `resume_server <port>`.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
-use mls_tls::{ConnectionCommon, ServerConfig, ServerConnection};
+use mls_tls::{
+    BasicCredential, ConnectionCommon, DEFAULT_CIPHER_SUITE, ServerConfig, ServerConnection,
+    SignaturePublicKey, SigningIdentity, generate_signature_key,
+};
+
+#[path = "interop/mod.rs"]
+mod interop;
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -44,7 +51,16 @@ fn recv_app(conn: &mut ConnectionCommon, sock: &mut TcpStream) -> io::Result<Vec
     }
 }
 
-fn handle(config: Arc<ServerConfig>, sock: &mut TcpStream, ack: &[u8]) -> io::Result<()> {
+fn handle(
+    config: Arc<ServerConfig>,
+    public: &SignaturePublicKey,
+    sock: &mut TcpStream,
+    ack: &[u8],
+) -> io::Result<()> {
+    // Python-only opening frame — sent on the resumed connection too, where the peer compares it
+    // against the key it saw the first time round.
+    interop::send_server_pubkey(sock, public)?;
+
     let mut server = ServerConnection::new(config).map_err(to_io)?;
     complete_handshake(&mut server, sock)?;
     let msg = recv_app(&mut server, sock)?;
@@ -65,18 +81,23 @@ fn main() -> io::Result<()> {
     eprintln!("listening {port}");
 
     // One config across both connections → shared (Arc-backed) session storage, so the second
-    // connection's Resumption can reload the group persisted by the first.
+    // connection's Resumption can reload the group persisted by the first. The keypair is kept
+    // rather than generated inside the builder: the peer expects its public half per connection.
+    let (signer, public) = generate_signature_key(DEFAULT_CIPHER_SUITE).map_err(to_io)?;
+    let identity = SigningIdentity::new(
+        BasicCredential::new(b"server".to_vec()).into_credential(),
+        public.clone(),
+    );
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_generated_basic_credential(b"server")
-        .map_err(to_io)?;
+        .with_server_credential(identity, signer);
 
     let (mut sock1, _) = listener.accept()?;
     sock1.set_nodelay(true).ok();
-    handle(config.clone(), &mut sock1, b"ack1 (rust server)")?;
+    handle(config.clone(), &public, &mut sock1, b"ack1 (rust server)")?;
 
     let (mut sock2, _) = listener.accept()?;
     sock2.set_nodelay(true).ok();
-    handle(config, &mut sock2, b"ack2 (rust server)")?;
+    handle(config, &public, &mut sock2, b"ack2 (rust server)")?;
     Ok(())
 }

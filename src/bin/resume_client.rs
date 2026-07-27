@@ -2,13 +2,17 @@
 //! exports the session, then opens a second connection that RESUMES the first and exchanges another
 //! message on the resumed epoch. Both connections reuse one config (shared session store).
 //!
-//! Usage: `resume_client <port>`.
+//! The Python peer opens each connection with a non-standard public-key frame, consumed here rather
+//! than by the library (see [`interop`]). Usage: `resume_client <port>`.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
 use mls_tls::{ClientConfig, ClientConnection, ConnectionCommon, ResumptionState, ServerName};
+
+#[path = "interop/mod.rs"]
+mod interop;
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -69,6 +73,7 @@ fn main() -> io::Result<()> {
     let resumption: ResumptionState = {
         let mut sock = TcpStream::connect(("127.0.0.1", port))?;
         sock.set_nodelay(true).ok();
+        interop::recv_server_pubkey(&mut sock)?;
         let mut client = ClientConnection::new(config.clone(), name.clone()).map_err(to_io)?;
         complete_handshake(&mut client, &mut sock)?;
         let reply = send_recv(&mut client, &mut sock, b"hello1 (rust client)")?;
@@ -80,6 +85,7 @@ fn main() -> io::Result<()> {
     {
         let mut sock = TcpStream::connect(("127.0.0.1", port))?;
         sock.set_nodelay(true).ok();
+        interop::recv_server_pubkey(&mut sock)?;
         let mut client = ClientConnection::resume(config, name, resumption).map_err(to_io)?;
         complete_handshake(&mut client, &mut sock)?;
         let reply = send_recv(&mut client, &mut sock, b"hello2 (rust client)")?;

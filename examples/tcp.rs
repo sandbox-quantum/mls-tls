@@ -29,8 +29,8 @@ fn main() {
 
         let (sock, _) = listener.accept().unwrap();
 
-        // The server speaks first (it sends its public key), so no Acceptor is needed: build the
-        // connection from the config and let StreamOwned drive the handshake on first I/O.
+        // There is no Acceptor type: build the connection from the config and let StreamOwned drive
+        // the handshake on first I/O — it blocks reading the client's ClientHello.
         let conn = ServerConnection::new(server_config).unwrap();
 
         let mut tls = StreamOwned::new(conn, sock);

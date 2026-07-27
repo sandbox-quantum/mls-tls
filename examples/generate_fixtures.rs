@@ -25,12 +25,12 @@ fn main() {
     .unwrap();
     fs::write(
         fixtures_dir.join("server_secret_key.bin"),
-        &signing_key.to_keypair_bytes(),
+        signing_key.to_keypair_bytes(),
     )
     .unwrap();
     fs::write(
         fixtures_dir.join("server_public_key.bin"),
-        &signing_key.verifying_key().to_bytes(),
+        signing_key.verifying_key().to_bytes(),
     )
     .unwrap();
 
