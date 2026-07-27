@@ -2,15 +2,15 @@
 """
 Live interop driver: run this repo's Rust MLS-TLS binaries against the Python
 `mls-tls-python-pedantic` peers over real TCP sockets, in both directions, covering the initial
-handshake, a mid-session rekey, and cross-connection resumption.
+handshake, a mid-session rekey, and resumption.
 
 Pairings:
   A  Python e2e_client        <->  Rust simple_server      (handshake + app-data)
   B  Rust  simple_client      <->  Python e2e_server       (handshake + app-data)
   K1 Rust  rekey_peer client  <->  Python py_rekey server  (client-initiated rekey)
   K2 Python py_rekey client   <->  Rust  rekey_peer server (client-initiated rekey)
-  R1 Rust  resume_client      <->  Python py_resume server (cross-connection resumption)
-  R2 Python py_resume client  <->  Rust  resume_server     (cross-connection resumption)
+    R1 Rust  resume_client      <->  Python py_resume server (resumption)
+    R2 Python py_resume client  <->  Rust  resume_server     (resumption)
 
 A pairing passes when every expected substring appears in the right peer's stdout. This driver only
 READS the Python project; it runs the Python peers with this repo's interop venv (mlkem/ecdsa/...).

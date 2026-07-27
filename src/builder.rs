@@ -1,9 +1,10 @@
-//! Shared typestate config builder, mirroring rustls' `ConfigBuilder<Side, State>`.
+//! Shared typestate config builder.
 //!
 //! `Side` is `ClientConfig` or `ServerConfig`; `State` is a zero-cost marker that advances at each
 //! `.with_*` call so required settings are provided exactly once, in order, checked at compile time.
-//! The cipher suite (`CURVE25519_AES128`) and crypto provider (`RustCryptoProvider`) are fixed, so
-//! the first stage a caller sees is the verifier (there are no cipher-suite/kx stages).
+//! The verifier is the first required stage; the crypto backend is fixed at compile time (feature
+//! `rustcrypto` or `openssl`) and the cipher suite has a sensible per-backend default with an optional
+//! `with_cipher_suite` override on the second stage.
 
 use std::marker::PhantomData;
 

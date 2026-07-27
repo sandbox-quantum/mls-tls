@@ -68,7 +68,8 @@ fn run_client(port: u16) -> io::Result<()> {
         .with_generated_basic_credential(b"client")
         .map_err(to_io)?;
     let mut client =
-        ClientConnection::new(config, ServerName::try_from("localhost").map_err(to_io)?).map_err(to_io)?;
+        ClientConnection::new(config, ServerName::try_from("localhost").map_err(to_io)?)
+            .map_err(to_io)?;
     complete_handshake(&mut client, &mut sock)?;
 
     send(&mut client, &mut sock, b"rekey1 (rust client)")?;
@@ -110,7 +111,10 @@ fn run_server(port: u16) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let role = std::env::args().nth(1).unwrap_or_default();
-    let port: u16 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8080);
+    let port: u16 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
     match role.as_str() {
         "client" => run_client(port),
         "server" => run_server(port),

@@ -49,7 +49,10 @@ where
             self.conn.process_new_packets().map_err(io_err)?;
             self.flush_output()?;
             if n == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed during handshake",
+                ));
             }
         }
         Ok(())
@@ -69,7 +72,10 @@ where
             self.conn.process_new_packets().map_err(io_err)?;
             self.flush_output()?; // processing may have queued control replies
             if n == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed before application data was available",
+                ));
             }
         }
         self.conn.reader().read(buf)

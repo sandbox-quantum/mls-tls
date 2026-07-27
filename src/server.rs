@@ -3,10 +3,6 @@
 //! `client_verifier` is the policy for how the server checks the **client's** credential from the
 //! incoming KeyPackage (consumed by `web_pki::validate_client_credential` at the handshake, not the
 //! mls-rs identity provider).
-//!
-//! Unlike rustls, there is no `Acceptor`: the server speaks first (it sends its signing public key
-//! before the ClientHello), so a [`ServerConnection`] is created directly from a config and the
-//! ClientHello is consumed inside `process_new_packets`.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -49,10 +45,12 @@ pub struct ServerConfig {
 /// Builder stage 1 (server): choose how to verify the client.
 pub struct WantsClientVerifier;
 
-/// Builder stage 2 (server): provide the server's own credential.
+/// Builder stage 2 (server): provide the server's own credential (and, optionally, override the
+/// cipher suite / session store).
 pub struct WantsServerCredential {
     client_verifier: ClientCertVerifier,
     session_store: InMemoryGroupStateStorage,
+    cipher_suite: CipherSuite,
 }
 
 impl ServerConfig {
@@ -65,10 +63,7 @@ impl ServerConfig {
 impl ConfigBuilder<ServerConfig, WantsClientVerifier> {
     /// Do not require client authentication (accept a Basic client credential).
     pub fn with_no_client_auth(self) -> ConfigBuilder<ServerConfig, WantsServerCredential> {
-        ConfigBuilder::new(WantsServerCredential {
-            client_verifier: ClientCertVerifier::Basic,
-            session_store: InMemoryGroupStateStorage::default(),
-        })
+        ConfigBuilder::new(WantsServerCredential::new(ClientCertVerifier::Basic))
     }
 
     /// Require a client X.509 certificate validated against the given anchors.
@@ -76,10 +71,21 @@ impl ConfigBuilder<ServerConfig, WantsClientVerifier> {
         self,
         trust_anchors: Vec<TrustAnchor<'static>>,
     ) -> ConfigBuilder<ServerConfig, WantsServerCredential> {
-        ConfigBuilder::new(WantsServerCredential {
-            client_verifier: ClientCertVerifier::WebPki { trust_anchors },
+        ConfigBuilder::new(WantsServerCredential::new(ClientCertVerifier::WebPki {
+            trust_anchors,
+        }))
+    }
+}
+
+impl WantsServerCredential {
+    /// Stage-2 defaults: the compiled backend's default cipher suite and a fresh session store.
+    /// Override with `with_cipher_suite` / `with_session_store`.
+    fn new(client_verifier: ClientCertVerifier) -> Self {
+        Self {
+            client_verifier,
             session_store: InMemoryGroupStateStorage::default(),
-        })
+            cipher_suite: CIPHER_SUITE,
+        }
     }
 }
 
@@ -88,6 +94,15 @@ impl ConfigBuilder<ServerConfig, WantsServerCredential> {
     /// reload groups established here.
     pub fn with_session_store(mut self, store: crate::resumption::SessionStore) -> Self {
         self.state.session_store = store.storage;
+        self
+    }
+
+    /// Select the MLS cipher suite (default
+    /// [`MLS_256_XWING_AES256GCM_SHA512_P384`](crate::MLS_256_XWING_AES256GCM_SHA512_P384) under the
+    /// `rustcrypto` backend, `P384_AES256` under `openssl`). The suite must be supported by the
+    /// compiled backend; selecting an unsupported one (e.g. X-Wing under `openssl`) fails at runtime.
+    pub fn with_cipher_suite(mut self, cipher_suite: CipherSuite) -> Self {
+        self.state.cipher_suite = cipher_suite;
         self
     }
 
@@ -103,7 +118,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCredential> {
             client_verifier: self.state.client_verifier,
             signing_identity,
             signer,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: self.state.cipher_suite,
             group_state_storage: self.state.session_store,
         })
     }
@@ -118,25 +133,24 @@ impl ConfigBuilder<ServerConfig, WantsServerCredential> {
             client_verifier: self.state.client_verifier,
             signing_identity,
             signer,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: self.state.cipher_suite,
             group_state_storage: self.state.session_store,
         })
     }
 
     /// Generate a fresh key and use a Basic credential (convenience for testing / examples where the
     /// server does not present an X.509 certificate).
-    pub fn with_generated_basic_credential(
-        self,
-        name: &[u8],
-    ) -> Result<Arc<ServerConfig>, Error> {
-        let (signer, public) = generate_signature_key()?;
-        let signing_identity =
-            SigningIdentity::new(BasicCredential::new(name.to_vec()).into_credential(), public);
+    pub fn with_generated_basic_credential(self, name: &[u8]) -> Result<Arc<ServerConfig>, Error> {
+        let (signer, public) = generate_signature_key(self.state.cipher_suite)?;
+        let signing_identity = SigningIdentity::new(
+            BasicCredential::new(name.to_vec()).into_credential(),
+            public,
+        );
         Ok(Arc::new(ServerConfig {
             client_verifier: self.state.client_verifier,
             signing_identity,
             signer,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: self.state.cipher_suite,
             group_state_storage: self.state.session_store,
         }))
     }

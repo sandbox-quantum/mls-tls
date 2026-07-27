@@ -76,10 +76,7 @@ fn format_node(node: &Option<Node>, index: usize, detailed: bool) -> String {
                 &pk.as_ref()[..4.min(pk.as_ref().len())]
             );
             if detailed {
-                s.push_str(&format!(
-                    "\n         sig_key={}",
-                    hex::encode(pk.as_ref())
-                ));
+                s.push_str(&format!("\n         sig_key={}", hex::encode(pk.as_ref())));
                 let hpke = &leaf.public_key;
                 s.push_str(&format!(
                     "\n         hpke_pk={}",
@@ -95,10 +92,7 @@ fn format_node(node: &Option<Node>, index: usize, detailed: bool) -> String {
                 &pk.as_ref()[..4.min(pk.as_ref().len())]
             );
             if detailed {
-                s.push_str(&format!(
-                    "\n         hpke_pk={}",
-                    hex::encode(pk.as_ref())
-                ));
+                s.push_str(&format!("\n         hpke_pk={}", hex::encode(pk.as_ref())));
             }
             s
         }
@@ -106,9 +100,19 @@ fn format_node(node: &Option<Node>, index: usize, detailed: bool) -> String {
     }
 }
 
-fn print_node(nodes: &[Option<Node>], index: usize, n: usize, prefix: &str, is_last: bool, detailed: bool) {
+fn print_node(
+    nodes: &[Option<Node>],
+    index: usize,
+    n: usize,
+    prefix: &str,
+    is_last: bool,
+    detailed: bool,
+) {
     let connector = if is_last { "`- " } else { "|- " };
-    println!("{prefix}{connector}{}", format_node(&nodes[index], index, detailed));
+    println!(
+        "{prefix}{connector}{}",
+        format_node(&nodes[index], index, detailed)
+    );
 
     if tree_level(index) == 0 {
         return;

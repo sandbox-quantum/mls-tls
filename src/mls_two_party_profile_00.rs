@@ -5,9 +5,7 @@ use mls_rs::{
     client_builder::MlsConfig,
     crypto::SignatureSecretKey,
     error::{IntoAnyError, MlsError},
-    group::{
-        GroupContext, Roster,
-    },
+    group::{GroupContext, Roster},
     identity::SigningIdentity,
     mls_rules::{CommitDirection, CommitOptions, CommitSource, EncryptionOptions, ProposalBundle},
     storage_provider::in_memory::InMemoryGroupStateStorage,
@@ -15,8 +13,7 @@ use mls_rs::{
 
 use crate::{
     mls_config::{MlsGroup, build_mls_client},
-    mls_tls::MlsTlsError,
-    mls_two_party_profile_00::State::{AwaitingEpochKeyUpdate, Synced},
+    mls_tls_01::MlsTlsError,
     tls_record::DirectionalRekey,
     web_pki::{WebPkiIdentityError, validate_client_credential},
 };
@@ -51,7 +48,6 @@ pub(crate) fn initial_key_agreement_initiator_1<C: MlsConfig>(
     // > The initiator starts the key agreement part of the protocol by
     // > creating a KeyPackage and sending a ClientHello to the responder.
 
-    // IMPLEMENTOR_NOTE: check the timestamp. Is it expiration? Is there any requirement on the extensions?
     let initiator_key_package_msg = initiator.generate_key_package_message(
         ExtensionList::default(),
         Default::default(),
@@ -72,21 +68,22 @@ pub(crate) fn initial_key_agreement_responder_1(
     // > The responder inspects the KeyPackage and checks whether it supports
     // > the offered ciphersuite and whether the initiator has sufficient
     // > capabilities to support the connection.
-    let initiator_key_package =
-        client_hello
-            .key_package
-            .as_key_package()
-            .ok_or(TwoPartyError::NotAKeyPackage)?;
+    let initiator_key_package = client_hello
+        .key_package
+        .as_key_package()
+        .ok_or(TwoPartyError::NotAKeyPackage)?;
     let initiator_offered_ciphersuite = initiator_key_package.cipher_suite;
     // Standard suites (1–7) plus the custom X-Wing suite (0x004e) our crypto provider adds.
     let server_supported_ciphersuites = CipherSuite::all()
-        .chain(std::iter::once(crate::crypto::XWING_CIPHER_SUITE))
+        .chain(std::iter::once(
+            crate::crypto::MLS_256_XWING_AES256GCM_SHA512_P384,
+        ))
         .collect::<BTreeSet<_>>();
 
-    // IMPLEMENTOR NOTE: MLS 2-party profile doesn't support ciphersuite negotiation.
-
     if !server_supported_ciphersuites.contains(&initiator_offered_ciphersuite) {
-        return Err(TwoPartyError::UnsupportedCipherSuite(initiator_offered_ciphersuite));
+        return Err(TwoPartyError::UnsupportedCipherSuite(
+            initiator_offered_ciphersuite,
+        ));
     }
 
     // > The responder MUST interface with the AS to ensure that the
@@ -116,7 +113,6 @@ pub(crate) fn initial_key_agreement_responder_1(
         .next()
         .ok_or(TwoPartyError::MissingWelcome)?;
     let server_hello = ServerHello { welcome };
-    // IMPLEMENTOR NOTE: when is the commit actually applied? I assume the server can do it right away, but it would be good to make it explicit.
     responder_group.apply_pending_commit()?;
 
     Ok((server_hello, responder_group))
@@ -147,7 +143,6 @@ pub(crate) fn initial_key_agreement_initiator_2<C: MlsConfig>(
 //     uint64 epoch;
 // } EpochKeyUpdate
 
-// IMPLEMENTOR'S NOTE: here we're missing 'Unless it's an initiator that is waiting for an epoch key update)
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionUpdate {
     pub(crate) update: MlsMessage,
@@ -162,7 +157,6 @@ pub(crate) struct EpochKeyUpdate {
 pub(crate) enum State {
     AwaitingEpochKeyUpdate,
     Synced,
-    AwaitingResumptionResponse,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,7 +196,7 @@ fn derive_initiator_secret<C: CryptoProvider + Clone>(
     crypto: &C,
 ) -> Result<Vec<u8>, TwoPartyError> {
     Ok(
-        crate::mls_tls::derive_client_application_traffic_secret(group, crypto.clone())?
+        crate::mls_tls_01::derive_client_application_traffic_secret(group, crypto.clone())?
             .as_bytes()
             .to_vec(),
     )
@@ -215,7 +209,7 @@ fn derive_responder_secret<C: CryptoProvider + Clone>(
     crypto: &C,
 ) -> Result<Vec<u8>, TwoPartyError> {
     Ok(
-        crate::mls_tls::derive_server_application_traffic_secret(group, crypto.clone())?
+        crate::mls_tls_01::derive_server_application_traffic_secret(group, crypto.clone())?
             .as_bytes()
             .to_vec(),
     )
@@ -235,7 +229,6 @@ fn both_secrets<C: CryptoProvider + Clone>(
 
 pub(crate) struct Mls2Party {
     state: State,
-    initial_role: Role,
     role: Role,
 }
 
@@ -248,7 +241,6 @@ impl Mls2Party {
     pub(crate) fn new(role: Role) -> Self {
         Self {
             state: State::Synced,
-            initial_role: role.clone(),
             role,
         }
     }
@@ -264,12 +256,12 @@ impl Mls2Party {
         //     waiting for an EpochKeyUpdate to confirm a previous
         //     ConnectionUpdate
 
-        // IMPLEMENTOR'S NOTE: the draft doesn't define what goes in the ConnectionUpdate commit message and how you generate it.
         match self.state {
             State::AwaitingEpochKeyUpdate => Ok(None),
             State::Synced => {
-                group.propose_update(vec![])?; // Note: this is automatically added when `path_required` is set as a commit options when
-                // creating the group. We add it to be explicit.
+                // `path_required` also forces an UpdatePath, but the explicit proposal keeps the
+                // generated commit aligned with the two-party profile's update-only rule.
+                group.propose_update(vec![])?;
                 let commit = group.commit(vec![])?;
                 let connection_update = ConnectionUpdate {
                     update: commit.commit_message,
@@ -295,7 +287,6 @@ impl Mls2Party {
                 self.state = State::AwaitingEpochKeyUpdate;
                 Ok(Some((connection_update, rekey)))
             }
-            State::AwaitingResumptionResponse => todo!(),
         }
     }
 
@@ -332,7 +323,8 @@ impl Mls2Party {
             // message of the 3-message responder-initiated flow.
             (State::Synced, Role::Initiator) => {
                 group.process_incoming_message(connection_update.update)?;
-                let rekey = DirectionalRekey::InitiatorSecret(derive_initiator_secret(group, crypto)?);
+                let rekey =
+                    DirectionalRekey::InitiatorSecret(derive_initiator_secret(group, crypto)?);
                 let epoch_key_update = EpochKeyUpdate {
                     epoch: group.current_epoch(),
                 };
@@ -365,9 +357,6 @@ impl Mls2Party {
                 self.state = State::Synced;
                 Ok((Some(rekey), Some(epoch_key_update)))
             }
-            (State::AwaitingResumptionResponse, _) => {
-                todo!() // TODO claude return err or ignore... // IMPLEMENTOR'S NOTE: This is actually not defined
-            }
         }
     }
 
@@ -393,7 +382,8 @@ impl Mls2Party {
                         got: epoch_key_update.epoch,
                     });
                 }
-                let rekey = DirectionalRekey::ResponderSecret(derive_responder_secret(group, crypto)?);
+                let rekey =
+                    DirectionalRekey::ResponderSecret(derive_responder_secret(group, crypto)?);
                 self.state = State::Synced;
                 Ok((Some(rekey), None))
             }
@@ -403,7 +393,7 @@ impl Mls2Party {
             // pending commit is unmerged, so the group is still one epoch behind — validate by
             // `current + 1`.
             //
-            // IMPLEMENTOR'S NOTE: this second EpochKeyUpdate is a deliberate deviation from the
+            // This second EpochKeyUpdate is a deliberate deviation from the
             // drafts. draft-kohbrok-mls-two-party-profile-00 §4 defines a single EpochKeyUpdate per
             // ConnectionUpdate; here a responder-initiated rotation is a 3-message flow
             // (ConnectionUpdate -> EpochKeyUpdate -> EpochKeyUpdate) so each transport direction is
@@ -425,9 +415,6 @@ impl Mls2Party {
                 Ok((Some(rekey), Some(return_epoch_key_update)))
             }
             (State::Synced, _) => Err(TwoPartyError::UnexpectedEpochKeyUpdate),
-            (State::AwaitingResumptionResponse, _) => {
-                todo!() // IMPLEMENTOR'S NOTE: this is actually not defined in the draft spec.
-            }
         }
     }
 }
@@ -473,14 +460,16 @@ impl Default for TwoPartyMlsRules {
         Self {
             commit_options: CommitOptions::default(),
             // Encrypt control messages so member commits are MLS PrivateMessages (wire_format
-            // 0x0002), matching the Python peer's ConnectionUpdate / Resumption framing (its parser
+            // 0x0002), matching the interoperable ConnectionUpdate / Resumption framing (its parser
             // rejects a PublicMessage commit). `PaddingMode::None` matches the Python framing;
             // receivers tolerate any padding regardless.
-            encryption_options: EncryptionOptions::new(true, mls_rs::client_builder::PaddingMode::None),
+            encryption_options: EncryptionOptions::new(
+                true,
+                mls_rs::client_builder::PaddingMode::None,
+            ),
         }
     }
 }
-
 
 impl mls_rs::MlsRules for TwoPartyMlsRules {
     type Error = TwoPartyRulesError;
@@ -536,18 +525,19 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
 //    } ResumptionResponse
 //
 
-#[derive(Clone, Debug)]
-pub(crate) struct ResumptionRequest {
-    pub(crate) commit: MlsMessage,
-}
+// Below are not used in the reference implementation. 
+// #[derive(Clone, Debug)]
+// pub(crate) struct ResumptionRequest {
+//     pub(crate) commit: MlsMessage,
+// }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ResumptionResponse {
-    pub(crate) commit: MlsMessage,
-}
+// #[derive(Clone, Debug)]
+// pub(crate) struct ResumptionResponse {
+//     pub(crate) commit: MlsMessage,
+// }
 
 impl Mls2Party {
-    /// Client resumption (the reference's `ConnectionConfirmation` model, matching the Python peer):
+    /// Client resumption (the draft specs' `ConnectionConfirmation` model):
     /// create a self-update commit and **merge it immediately**, advancing to the new epoch. Returns
     /// the commit to carry in the Resumption message. The responder replies with a bare
     /// `ConnectionConfirmation` (no responder commit), so the initiator installs both new-epoch
@@ -578,130 +568,4 @@ impl Mls2Party {
         self.state = State::Synced;
         Ok(group.current_epoch())
     }
-
-    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
-    pub(crate) fn create_resumption_request(
-        &mut self,
-        group: &mut Group<impl MlsConfig>,
-    ) -> Result<ResumptionRequest, TwoPartyError> {
-        //    The initiator sends a Resumption message to the responder.
-
-        match &self.state {
-            // If the initiator was waiting for an EpochKeyUpdate while the connection was
-            // interrupted, it MUST include the commit from the last
-            // ConnectionUpdate in the Resumption message.
-            State::AwaitingEpochKeyUpdate => {
-                // TODO
-                todo!()
-            }
-            State::Synced => {
-                group.propose_update(vec![])?; // TODO: I think that's unnecessary to rotate the HPKE
-                let commit = group.commit(vec![])?;
-
-                self.state = State::AwaitingResumptionResponse;
-                self.role = Role::Initiator; // Check when that state must change then.
-                Ok(ResumptionRequest {
-                    commit: commit.commit_message,
-                })
-            }
-            State::AwaitingResumptionResponse => Err(TwoPartyError::InvalidState("cannot create a ResumptionRequest while waiting for a ResumptionResponse")),
-        }
-
-        // The initiator MUST then wait for a ResumptionResponse.
-    }
-
-    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
-    pub(crate) fn handle_resumption_request(
-        &mut self,
-        group: &mut Group<impl MlsConfig>,
-        resumption_request: ResumptionRequest,
-    ) -> Result<Option<ResumptionResponse>, TwoPartyError> {
-        if self.role != Role::Responder {
-            return Err(TwoPartyError::InvalidState("handle_resumption_request called on a non-responder"));
-        }
-
-        match self.state {
-            AwaitingEpochKeyUpdate => todo!(), // IMPLEMENTOR'S NOTE: note define what happens where
-            Synced => {
-                group.clear_pending_commit();
-                group.clear_proposal_cache(); // TODO I think this is unnecessary. To check
-
-                self.role = Role::Responder;
-
-                //    The responder receiving a ResumptionRequest MUST validate and apply
-                //    the commit in the ResumptionRequest and create a commit with
-                //    UpdatPath to send back as part of a ResumptionResponse.
-
-                group.process_incoming_message(resumption_request.commit)?;
-
-                let commit = group.commit(vec![])?;
-                group.apply_pending_commit()?;
-
-                // IMPLEMENTOR'S NOTE: TODO investigate more: What happens if the responder receives two resumption requests? Are we going to get out of sync.
-
-                Ok(Some(ResumptionResponse {
-                    commit: commit.commit_message,
-                }))
-            }
-            State::AwaitingResumptionResponse => {
-                //    If one of the parties receives a ResumptionRequest while waiting for
-                //    a ResumptionResponse, their reaction depends whether they were the
-                //    initial initiator or responder when the connection was first
-                //    established.  The initial initiator MUST drop the ResumptionRequest
-                //    and continue waiting.  The initial responder MUST drop its pending
-                //    commit and instead validate and apply the incoming commit before
-                //    responding with a fresh commit as part of a ResumptionResponse.
-                match self.initial_role {
-                    Role::Initiator => Ok(None),
-                    Role::Responder => {
-                        self.role = Role::Responder;
-                        group.clear_proposal_cache(); // TODO check if that's necessary
-                        group.clear_pending_commit();
-
-                        group.process_incoming_message(resumption_request.commit)?;
-                        group.apply_pending_commit()?;
-
-                        let commit = group.commit(vec![])?;
-                        group.apply_pending_commit()?;
-
-                        self.state = State::Synced;
-
-                        Ok(Some(ResumptionResponse {
-                            commit: commit.commit_message,
-                        }))
-                    }
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)] // draft dual-commit resumption model (superseded by the ConnectionConfirmation model)
-    pub(crate) fn handle_resumption_response(
-        &mut self,
-        group: &mut Group<impl MlsConfig>,
-        resumption_response: ResumptionResponse,
-    ) -> Result<(), TwoPartyError> {
-        if self.role == Role::Responder {
-            unimplemented!("Shouldn't happen what sort of error should we do there?");
-        }
-
-        match self.state {
-            AwaitingEpochKeyUpdate => {
-                unimplemented!("What should we do there?")
-            }
-            Synced => {
-                unimplemented!("What should do there?")
-            }
-            State::AwaitingResumptionResponse => {
-                group.apply_pending_commit()?;
-                group.process_incoming_message(resumption_response.commit)?;
-                self.state = State::Synced;
-                Ok(())
-            }
-        }
-    }
 }
-
-// IMPLEMENTOR'S NOTE: no error path has been defined in case the resumption is not possible.
-
-// IMPLEMENTOR's NOTE: what happens if data is sent after the resumption request has been sent, but then 

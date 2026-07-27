@@ -1,8 +1,5 @@
 //! The custom "X-Wing" hybrid KEM: ML-KEM-1024 + NIST P-384, with a SHA3-384 combiner.
 //!
-//! This is a byte-exact port of the Python `crypto/xwing_kem.py` in `mls-tls-python-pedantic`
-//! (which is itself a port of the `kkohbrok/KEMs` X-Wing variant). It is NOT standard X-Wing
-//! (which is ML-KEM-768 + X25519); every constant below matters for interoperability.
 //!
 //! Layout:
 //! - public/encapsulation key = ML-KEM-1024 ek (1568) ‖ P-384 uncompressed point (97) = 1665 B
@@ -76,15 +73,14 @@ fn expand_seed(ikm: &[u8]) -> ([u8; 32], [u8; 32], [u8; 48]) {
     (d, z, s)
 }
 
-/// Interpret 48 big-endian bytes as a P-384 scalar WITHOUT reduction (matches Python
+/// Interpret 48 big-endian bytes as a P-384 scalar WITHOUT reduction 
 /// `ec.derive_private_key`, which rejects scalars ≥ n). Errors on the negligible ≥n case.
 fn p384_scalar_no_reduce(bytes: &[u8; 48]) -> Result<Scalar, XWingError> {
     let fb = FieldBytes::clone_from_slice(bytes);
     Option::<Scalar>::from(Scalar::from_repr(fb)).ok_or(XWingError::P384)
 }
 
-/// Reduce 48 big-endian bytes mod n into a P-384 scalar (matches Python's ephemeral scalar, where
-/// the `ecdsa` group multiply reduces mod n).
+/// Reduce 48 big-endian bytes mod n into a P-384 scalar 
 fn p384_scalar_reduce(bytes: &[u8; 48]) -> Scalar {
     Scalar::reduce(U384::from_be_slice(bytes))
 }
@@ -243,8 +239,8 @@ impl KemType for XWingKem {
             return Err(XWingError::InvalidKeyLength(bytes.len()));
         }
         // Validate the ML-KEM half parses and the P-384 half is a valid point.
-        let ek_key =
-            Key::<EncapsulationKey1024>::try_from(&bytes[..MLKEM_EK]).map_err(|_| XWingError::MlKem)?;
+        let ek_key = Key::<EncapsulationKey1024>::try_from(&bytes[..MLKEM_EK])
+            .map_err(|_| XWingError::MlKem)?;
         EncapsulationKey1024::new(&ek_key).map_err(|_| XWingError::MlKem)?;
         p384_parse_point(&bytes[MLKEM_EK..])?;
         Ok(())
@@ -294,7 +290,10 @@ mod tests {
         let expected_pk = hexf(v, "pk");
         let (sk, pk) = derive_keypair(&ikm).unwrap();
         assert_eq!(sk, ikm, "stored secret should be the IKM");
-        assert_eq!(pk, expected_pk, "X-Wing public key mismatch vs Python DeriveKeyPair");
+        assert_eq!(
+            pk, expected_pk,
+            "X-Wing public key mismatch vs Python DeriveKeyPair"
+        );
     }
 
     #[test]
@@ -307,7 +306,11 @@ mod tests {
             &hex::decode(ci["ct_x"].as_str().unwrap()).unwrap(),
             &hex::decode(ci["pk_x"].as_str().unwrap()).unwrap(),
         );
-        assert_eq!(out, hexf(v, "combiner_out"), "SHA3-384 combiner mismatch vs Python");
+        assert_eq!(
+            out,
+            hexf(v, "combiner_out"),
+            "SHA3-384 combiner mismatch vs Python"
+        );
     }
 
     #[test]
@@ -317,8 +320,16 @@ mod tests {
         let mut rand = [0u8; 80];
         rand.copy_from_slice(&hexf(v, "encap_randomness"));
         let (enc, ss) = encapsulate_deterministic(&pk, &rand).unwrap();
-        assert_eq!(enc, hexf(v, "enc"), "X-Wing enc mismatch vs Python encapsulate");
-        assert_eq!(ss, hexf(v, "ss"), "X-Wing shared secret mismatch vs Python encapsulate");
+        assert_eq!(
+            enc,
+            hexf(v, "enc"),
+            "X-Wing enc mismatch vs Python encapsulate"
+        );
+        assert_eq!(
+            ss,
+            hexf(v, "ss"),
+            "X-Wing shared secret mismatch vs Python encapsulate"
+        );
     }
 
     #[test]

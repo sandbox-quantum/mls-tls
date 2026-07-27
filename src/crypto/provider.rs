@@ -1,5 +1,14 @@
-//! The `mls-rs` [`CryptoProvider`] that adds the X-Wing suite (`0x004e`) on top of the standard
-//! RustCrypto suites (1–7).
+//! The `mls-rs` [`CryptoProvider`] for the crate, over a **single, compile-time-selected** standard
+//! backend — RustCrypto (feature `rustcrypto`, default) or OpenSSL (feature `openssl`). The two
+//! features are mutually exclusive (enforced by a `compile_error!` in `lib.rs`).
+//!
+//! Under `rustcrypto` the provider also adds the custom X-Wing suite (`0x004e`) via
+//! [`XWingCipherSuite`]. Under `openssl` there is no X-Wing suite: `cipher_suite_provider(0x004e)`
+//! returns `None`, which mls-rs surfaces as `UnsupportedCipherSuite` at runtime (X-Wing's bespoke
+//! ML-KEM + P-384 KEM has no byte-compatible OpenSSL path, so it is RustCrypto-only by construction).
+//!
+//! Because exactly one backend is compiled, the HPKE context types are uniform
+//! (`ContextS/R<Kdf, Aead>` of the active backend) and no cross-backend bridging is needed.
 //!
 //! [`XWingCipherSuite`] implements [`CipherSuiteProvider`] by:
 //! - running HPKE through `mls-rs-crypto-hpke`'s `Hpke` with our [`XWingKem`] and an **HKDF-SHA384**
@@ -16,37 +25,62 @@ use mls_rs_core::crypto::{
     CipherSuite, CipherSuiteProvider, CryptoProvider, HpkeCiphertext, HpkePsk, HpkePublicKey,
     HpkeSecretKey, SignaturePublicKey, SignatureSecretKey,
 };
-use mls_rs_core::error::{AnyError, IntoAnyError};
+#[cfg(feature = "rustcrypto")]
+use mls_rs_core::error::AnyError;
+use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_hpke::{
     context::{ContextR, ContextS},
-    hpke::{Hpke, HpkeError},
+    hpke::HpkeError,
 };
+use zeroize::Zeroizing;
+
+// The compile-time-selected standard backend. `Kdf`/`Aead` are the backend's HPKE KDF/AEAD types,
+// which parameterise the shared `ContextS/R` HPKE context types.
+#[cfg(feature = "openssl")]
+use mls_rs_crypto_openssl::{
+    OpensslCryptoError as BackendError, OpensslCryptoProvider as BackendProvider, aead::Aead,
+    kdf::Kdf,
+};
+#[cfg(feature = "rustcrypto")]
 use mls_rs_crypto_rustcrypto::{
-    RustCryptoError, RustCryptoProvider,
+    RustCryptoError as BackendError, RustCryptoProvider as BackendProvider,
     aead::Aead,
     ec_signer::{EcSigner, EcSignerError},
     kdf::Kdf,
     mac::{Hash, HashError},
 };
-use mls_rs_crypto_traits::{AeadType, KdfType, KemType};
-use zeroize::Zeroizing;
 
-use super::XWING_CIPHER_SUITE;
+#[cfg(feature = "rustcrypto")]
+use mls_rs_crypto_hpke::hpke::Hpke;
+#[cfg(feature = "rustcrypto")]
+use mls_rs_crypto_traits::{AeadType, KdfType, KemType};
+
+#[cfg(feature = "rustcrypto")]
+use super::MLS_256_XWING_AES256GCM_SHA512_P384;
+#[cfg(feature = "rustcrypto")]
 use super::xwing::{XWingError, XWingKem};
 
-/// The concrete standard-suite cipher-suite provider produced by [`RustCryptoProvider`].
-type StdCsp = <RustCryptoProvider as CryptoProvider>::CipherSuiteProvider;
+/// The concrete standard-suite cipher-suite provider produced by the active backend.
+type StdCsp = <BackendProvider as CryptoProvider>::CipherSuiteProvider;
 
 /// Unified error for the composite provider.
 #[derive(Debug)]
 pub(crate) enum MlsTlsCryptoError {
-    Std(RustCryptoError),
-    Kem(XWingError),
+    /// An error from the active standard backend.
+    Std(BackendError),
+    /// An HPKE error (both backends share `mls-rs-crypto-hpke`'s `HpkeError`).
     Hpke(HpkeError),
+    #[cfg(feature = "rustcrypto")]
+    Kem(XWingError),
+    #[cfg(feature = "rustcrypto")]
     Kdf(AnyError),
+    #[cfg(feature = "rustcrypto")]
     Aead(AnyError),
+    #[cfg(feature = "rustcrypto")]
     Hash(HashError),
+    #[cfg(feature = "rustcrypto")]
     EcSigner(EcSignerError),
+    #[cfg(feature = "rustcrypto")]
     Rand,
 }
 
@@ -54,12 +88,18 @@ impl core::fmt::Display for MlsTlsCryptoError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             MlsTlsCryptoError::Std(e) => write!(f, "{e}"),
-            MlsTlsCryptoError::Kem(e) => write!(f, "{e}"),
             MlsTlsCryptoError::Hpke(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
+            MlsTlsCryptoError::Kem(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCryptoError::Kdf(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCryptoError::Aead(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCryptoError::Hash(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCryptoError::EcSigner(e) => write!(f, "{e}"),
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCryptoError::Rand => write!(f, "RNG failure"),
         }
     }
@@ -73,14 +113,9 @@ impl IntoAnyError for MlsTlsCryptoError {
     }
 }
 
-impl From<RustCryptoError> for MlsTlsCryptoError {
-    fn from(e: RustCryptoError) -> Self {
+impl From<BackendError> for MlsTlsCryptoError {
+    fn from(e: BackendError) -> Self {
         MlsTlsCryptoError::Std(e)
-    }
-}
-impl From<XWingError> for MlsTlsCryptoError {
-    fn from(e: XWingError) -> Self {
-        MlsTlsCryptoError::Kem(e)
     }
 }
 impl From<HpkeError> for MlsTlsCryptoError {
@@ -88,18 +123,27 @@ impl From<HpkeError> for MlsTlsCryptoError {
         MlsTlsCryptoError::Hpke(e)
     }
 }
+#[cfg(feature = "rustcrypto")]
+impl From<XWingError> for MlsTlsCryptoError {
+    fn from(e: XWingError) -> Self {
+        MlsTlsCryptoError::Kem(e)
+    }
+}
+#[cfg(feature = "rustcrypto")]
 impl From<HashError> for MlsTlsCryptoError {
     fn from(e: HashError) -> Self {
         MlsTlsCryptoError::Hash(e)
     }
 }
+#[cfg(feature = "rustcrypto")]
 impl From<EcSignerError> for MlsTlsCryptoError {
     fn from(e: EcSignerError) -> Self {
         MlsTlsCryptoError::EcSigner(e)
     }
 }
 
-/// The X-Wing (`0x004e`) cipher-suite provider.
+/// The X-Wing (`0x004e`) cipher-suite provider (RustCrypto-backed; see the module docs).
+#[cfg(feature = "rustcrypto")]
 #[derive(Clone)]
 pub(crate) struct XWingCipherSuite {
     hpke: Hpke<XWingKem, Kdf, Aead>,
@@ -110,6 +154,7 @@ pub(crate) struct XWingCipherSuite {
     ec_signer: EcSigner,
 }
 
+#[cfg(feature = "rustcrypto")]
 impl XWingCipherSuite {
     pub(crate) fn new() -> Self {
         let kem = XWingKem;
@@ -130,13 +175,14 @@ impl XWingCipherSuite {
     }
 }
 
+#[cfg(feature = "rustcrypto")]
 impl CipherSuiteProvider for XWingCipherSuite {
     type Error = MlsTlsCryptoError;
     type HpkeContextS = ContextS<Kdf, Aead>;
     type HpkeContextR = ContextR<Kdf, Aead>;
 
     fn cipher_suite(&self) -> CipherSuite {
-        XWING_CIPHER_SUITE
+        MLS_256_XWING_AES256GCM_SHA512_P384
     }
 
     fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
@@ -246,14 +292,9 @@ impl CipherSuiteProvider for XWingCipherSuite {
         aad: Option<&[u8]>,
         psk: HpkePsk<'_>,
     ) -> Result<Zeroizing<Vec<u8>>, Self::Error> {
-        Ok(self.hpke.open(
-            ciphertext,
-            local_secret,
-            local_public,
-            info,
-            Some(psk),
-            aad,
-        )?)
+        Ok(self
+            .hpke
+            .open(ciphertext, local_secret, local_public, info, Some(psk), aad)?)
     }
 
     fn hpke_setup_s(
@@ -291,7 +332,9 @@ impl CipherSuiteProvider for XWingCipherSuite {
 
     fn random_bytes(&self, out: &mut [u8]) -> Result<(), Self::Error> {
         use rand_core::{OsRng, RngCore};
-        OsRng.try_fill_bytes(out).map_err(|_| MlsTlsCryptoError::Rand)
+        OsRng
+            .try_fill_bytes(out)
+            .map_err(|_| MlsTlsCryptoError::Rand)
     }
 
     fn signature_key_generate(
@@ -321,12 +364,12 @@ impl CipherSuiteProvider for XWingCipherSuite {
     }
 }
 
-/// A cipher-suite provider that is either a standard RustCrypto suite or the X-Wing suite. Both
-/// share the same concrete HPKE context types (`ContextS/R<Kdf, Aead>`), so no context enum is
-/// needed.
+/// A cipher-suite provider: a standard suite from the active backend, or (under `rustcrypto`) the
+/// X-Wing suite. Both share the backend's concrete HPKE context types (`ContextS/R<Kdf, Aead>`).
 #[derive(Clone)]
 pub(crate) enum MlsTlsCipherSuiteProvider {
     Standard(StdCsp),
+    #[cfg(feature = "rustcrypto")]
     XWing(XWingCipherSuite),
 }
 
@@ -335,6 +378,18 @@ macro_rules! delegate {
     ($self:ident, $p:ident => $call:expr) => {
         match $self {
             MlsTlsCipherSuiteProvider::Standard($p) => $call.map_err(MlsTlsCryptoError::Std),
+            #[cfg(feature = "rustcrypto")]
+            MlsTlsCipherSuiteProvider::XWing($p) => $call,
+        }
+    };
+}
+
+/// Delegate an infallible `&self` accessor to whichever inner provider is active.
+macro_rules! delegate_plain {
+    ($self:ident, $p:ident => $call:expr) => {
+        match $self {
+            MlsTlsCipherSuiteProvider::Standard($p) => $call,
+            #[cfg(feature = "rustcrypto")]
             MlsTlsCipherSuiteProvider::XWing($p) => $call,
         }
     };
@@ -346,10 +401,7 @@ impl CipherSuiteProvider for MlsTlsCipherSuiteProvider {
     type HpkeContextR = ContextR<Kdf, Aead>;
 
     fn cipher_suite(&self) -> CipherSuite {
-        match self {
-            MlsTlsCipherSuiteProvider::Standard(p) => p.cipher_suite(),
-            MlsTlsCipherSuiteProvider::XWing(p) => p.cipher_suite(),
-        }
+        delegate_plain!(self, p => p.cipher_suite())
     }
 
     fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
@@ -381,17 +433,11 @@ impl CipherSuiteProvider for MlsTlsCipherSuiteProvider {
     }
 
     fn aead_key_size(&self) -> usize {
-        match self {
-            MlsTlsCipherSuiteProvider::Standard(p) => p.aead_key_size(),
-            MlsTlsCipherSuiteProvider::XWing(p) => p.aead_key_size(),
-        }
+        delegate_plain!(self, p => p.aead_key_size())
     }
 
     fn aead_nonce_size(&self) -> usize {
-        match self {
-            MlsTlsCipherSuiteProvider::Standard(p) => p.aead_nonce_size(),
-            MlsTlsCipherSuiteProvider::XWing(p) => p.aead_nonce_size(),
-        }
+        delegate_plain!(self, p => p.aead_nonce_size())
     }
 
     fn kdf_extract(&self, salt: &[u8], ikm: &[u8]) -> Result<Zeroizing<Vec<u8>>, Self::Error> {
@@ -408,10 +454,7 @@ impl CipherSuiteProvider for MlsTlsCipherSuiteProvider {
     }
 
     fn kdf_extract_size(&self) -> usize {
-        match self {
-            MlsTlsCipherSuiteProvider::Standard(p) => p.kdf_extract_size(),
-            MlsTlsCipherSuiteProvider::XWing(p) => p.kdf_extract_size(),
-        }
+        delegate_plain!(self, p => p.kdf_extract_size())
     }
 
     fn hpke_seal(
@@ -519,10 +562,11 @@ impl CipherSuiteProvider for MlsTlsCipherSuiteProvider {
     }
 }
 
-/// The composite [`CryptoProvider`]: standard RustCrypto suites plus X-Wing (`0x004e`).
+/// The composite [`CryptoProvider`]: the compile-time-selected standard backend, plus (under
+/// `rustcrypto`) the X-Wing suite (`0x004e`).
 #[derive(Clone, Default)]
 pub(crate) struct MlsTlsCryptoProvider {
-    inner: RustCryptoProvider,
+    inner: BackendProvider,
 }
 
 impl MlsTlsCryptoProvider {
@@ -535,8 +579,10 @@ impl CryptoProvider for MlsTlsCryptoProvider {
     type CipherSuiteProvider = MlsTlsCipherSuiteProvider;
 
     fn supported_cipher_suites(&self) -> Vec<CipherSuite> {
+        #[allow(unused_mut)]
         let mut suites = self.inner.supported_cipher_suites();
-        suites.push(XWING_CIPHER_SUITE);
+        #[cfg(feature = "rustcrypto")]
+        suites.push(MLS_256_XWING_AES256GCM_SHA512_P384);
         suites
     }
 
@@ -544,12 +590,12 @@ impl CryptoProvider for MlsTlsCryptoProvider {
         &self,
         cipher_suite: CipherSuite,
     ) -> Option<Self::CipherSuiteProvider> {
-        if cipher_suite == XWING_CIPHER_SUITE {
-            Some(MlsTlsCipherSuiteProvider::XWing(XWingCipherSuite::new()))
-        } else {
-            self.inner
-                .cipher_suite_provider(cipher_suite)
-                .map(MlsTlsCipherSuiteProvider::Standard)
+        #[cfg(feature = "rustcrypto")]
+        if cipher_suite == MLS_256_XWING_AES256GCM_SHA512_P384 {
+            return Some(MlsTlsCipherSuiteProvider::XWing(XWingCipherSuite::new()));
         }
+        self.inner
+            .cipher_suite_provider(cipher_suite)
+            .map(MlsTlsCipherSuiteProvider::Standard)
     }
 }

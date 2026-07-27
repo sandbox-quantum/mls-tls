@@ -1,4 +1,4 @@
-//! Interop client for cross-connection resumption. Opens a fresh connection, exchanges one message,
+//! Interop client for resumption. Opens a fresh connection, exchanges one message,
 //! exports the session, then opens a second connection that RESUMES the first and exchanges another
 //! message on the resumed epoch. Both connections reuse one config (shared session store).
 //!
@@ -54,7 +54,10 @@ fn send_recv(conn: &mut ConnectionCommon, sock: &mut TcpStream, msg: &[u8]) -> i
 }
 
 fn main() -> io::Result<()> {
-    let port: u16 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8080);
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
     let name = ServerName::try_from("localhost").map_err(to_io)?;
 
     let config: Arc<ClientConfig> = ClientConfig::builder()
@@ -77,8 +80,7 @@ fn main() -> io::Result<()> {
     {
         let mut sock = TcpStream::connect(("127.0.0.1", port))?;
         sock.set_nodelay(true).ok();
-        let mut client =
-            ClientConnection::resume(config, name, resumption).map_err(to_io)?;
+        let mut client = ClientConnection::resume(config, name, resumption).map_err(to_io)?;
         complete_handshake(&mut client, &mut sock)?;
         let reply = send_recv(&mut client, &mut sock, b"hello2 (rust client)")?;
         println!("CLIENT_RECEIVED_2: {}", String::from_utf8_lossy(&reply));

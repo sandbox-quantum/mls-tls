@@ -1,11 +1,14 @@
+#![cfg(feature = "rustcrypto")]
+//! Only meaningful under the `rustcrypto` backend (the OpenSSL build has no `ml-kem`/X-Wing).
+//!
 //! Phase-0 gate: confirm RustCrypto `ml-kem` (FIPS 203) is byte-compatible with the Python
 //! `mlkem==0.0.3` used by `mls-tls-python-pedantic`. If this fails, the whole interop effort is
 //! impossible with this `ml-kem` and we must stop.
 //!
 //! Vectors are produced by `interop/dump_kat.py` (fixed inputs) into `interop/kat_vectors.json`.
 
-use ml_kem::{B32, Decapsulate, DecapsulationKey1024, EncapsulationKey1024, KeyExport, Seed};
 use ml_kem::ml_kem_1024::Ciphertext;
+use ml_kem::{B32, Decapsulate, DecapsulationKey1024, EncapsulationKey1024, KeyExport, Seed};
 
 fn load_vectors() -> serde_json::Value {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/interop/kat_vectors.json");
@@ -15,7 +18,12 @@ fn load_vectors() -> serde_json::Value {
 }
 
 fn hexv(v: &serde_json::Value, key: &str) -> Vec<u8> {
-    hex::decode(v[key].as_str().unwrap_or_else(|| panic!("missing hex field {key}"))).unwrap()
+    hex::decode(
+        v[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing hex field {key}")),
+    )
+    .unwrap()
 }
 
 #[test]

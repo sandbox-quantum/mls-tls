@@ -1,4 +1,4 @@
-//! Wire framing aligned with the Python `mls-tls-python-pedantic`.
+//! Wire framing aligned for interopearibility.
 //!
 //! Every message travels in an **outer transport frame** with a 5-byte TLS-record header whose
 //! content type is always `0x17` (application_data): `0x17 0x0303 u16(len) payload`. The transport
@@ -125,7 +125,10 @@ impl Envelope {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Signaling {
     /// A rekey commit (MLS `PrivateMessage`), with the `update_requested` flag.
-    ConnectionUpdate { update_requested: bool, commit: MlsMessage },
+    ConnectionUpdate {
+        update_requested: bool,
+        commit: MlsMessage,
+    },
     /// The peer confirms it advanced to `epoch`.
     EpochKeyUpdate(u64),
     /// The responder confirms a resumption advanced to `epoch`.
@@ -136,9 +139,16 @@ impl Signaling {
     pub(crate) fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         match self {
-            Signaling::ConnectionUpdate { update_requested, commit } => {
+            Signaling::ConnectionUpdate {
+                update_requested,
+                commit,
+            } => {
                 out.extend_from_slice(&SIGNALING_CONNECTION_UPDATE.to_be_bytes());
-                out.push(if *update_requested { BOOL_TRUE } else { BOOL_FALSE });
+                out.push(if *update_requested {
+                    BOOL_TRUE
+                } else {
+                    BOOL_FALSE
+                });
                 out.extend_from_slice(&commit.to_bytes()?);
             }
             Signaling::EpochKeyUpdate(epoch) => {
@@ -166,7 +176,10 @@ impl Signaling {
                     .ok_or(Error::Decode("short ConnectionUpdate"))?;
                 let update_requested = *flag == BOOL_TRUE;
                 let commit = MlsMessage::from_bytes(msg_bytes)?;
-                Ok(Signaling::ConnectionUpdate { update_requested, commit })
+                Ok(Signaling::ConnectionUpdate {
+                    update_requested,
+                    commit,
+                })
             }
             SIGNALING_EPOCH_KEY_UPDATE => Ok(Signaling::EpochKeyUpdate(read_u64(rest)?)),
             SIGNALING_CONNECTION_CONFIRMATION => {
@@ -178,6 +191,8 @@ impl Signaling {
 }
 
 fn read_u64(bytes: &[u8]) -> Result<u64, Error> {
-    let arr: [u8; 8] = bytes.try_into().map_err(|_| Error::Decode("bad u64 length"))?;
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| Error::Decode("bad u64 length"))?;
     Ok(u64::from_be_bytes(arr))
 }

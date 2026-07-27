@@ -29,10 +29,13 @@ use crate::mls_two_party_profile_00::{Mls2Party, Role, initial_key_agreement_ini
 use crate::resumption::ResumptionState;
 use crate::tls_record::Role as Side;
 
-/// The default cipher suite: the custom X-Wing suite (`0x004e`) used for interop with the Python
-/// implementation. The CURVE25519 suite remains selectable via the crypto provider for the crate's
-/// own tests.
-pub(crate) const CIPHER_SUITE: CipherSuite = crate::crypto::XWING_CIPHER_SUITE;
+/// The default cipher suite, per compiled backend. Under `rustcrypto` it is the custom X-Wing suite
+/// (`0x004e`); under `openssl` (which has no X-Wing) it is `P384_AES256`.
+/// Any suite the backend supports can be selected via `with_cipher_suite`.
+#[cfg(feature = "rustcrypto")]
+pub(crate) const CIPHER_SUITE: CipherSuite = crate::crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
+#[cfg(feature = "openssl")]
+pub(crate) const CIPHER_SUITE: CipherSuite = CipherSuite::P384_AES256;
 
 /// How the client verifies the **server's** credential.
 ///
@@ -63,10 +66,12 @@ pub struct ClientConfig {
 /// Builder stage 1 (client): choose how to verify the server.
 pub struct WantsVerifier;
 
-/// Builder stage 2 (client): provide this client's own credential.
+/// Builder stage 2 (client): provide this client's own credential (and, optionally, override the
+/// cipher suite / session store).
 pub struct WantsClientCredential {
     verifier: ServerCertVerifier,
     session_store: InMemoryGroupStateStorage,
+    cipher_suite: CipherSuite,
 }
 
 impl ClientConfig {
@@ -82,20 +87,16 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
         self,
         trust_anchors: Vec<TrustAnchor<'static>>,
     ) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
-        ConfigBuilder::new(WantsClientCredential {
-            verifier: ServerCertVerifier::WebPki { trust_anchors },
-            session_store: InMemoryGroupStateStorage::default(),
-        })
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::WebPki {
+            trust_anchors,
+        }))
     }
 
     /// Verify the server against the Mozilla webpki root set.
     pub fn with_webpki_roots(self) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
-        ConfigBuilder::new(WantsClientCredential {
-            verifier: ServerCertVerifier::WebPki {
-                trust_anchors: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-            },
-            session_store: InMemoryGroupStateStorage::default(),
-        })
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::WebPki {
+            trust_anchors: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        }))
     }
 
     /// Do not verify the server's certificate. Accepts any credential — use only when peer
@@ -103,10 +104,19 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     pub fn with_no_certificate_verification(
         self,
     ) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
-        ConfigBuilder::new(WantsClientCredential {
-            verifier: ServerCertVerifier::None,
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::None))
+    }
+}
+
+impl WantsClientCredential {
+    /// Stage-2 defaults: the compiled backend's default cipher suite and a fresh session store.
+    /// Override with `with_cipher_suite` / `with_session_store`.
+    fn new(verifier: ServerCertVerifier) -> Self {
+        Self {
+            verifier,
             session_store: InMemoryGroupStateStorage::default(),
-        })
+            cipher_suite: CIPHER_SUITE,
+        }
     }
 }
 
@@ -115,6 +125,15 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
     /// resumable state with) another config built from the same store.
     pub fn with_session_store(mut self, store: crate::resumption::SessionStore) -> Self {
         self.state.session_store = store.storage;
+        self
+    }
+
+    /// Select the MLS cipher suite (default
+    /// [`MLS_256_XWING_AES256GCM_SHA512_P384`](crate::MLS_256_XWING_AES256GCM_SHA512_P384) under the
+    /// `rustcrypto` backend, `P384_AES256` under `openssl`). The suite must be supported by the
+    /// compiled backend; selecting an unsupported one (e.g. X-Wing under `openssl`) fails at runtime.
+    pub fn with_cipher_suite(mut self, cipher_suite: CipherSuite) -> Self {
+        self.state.cipher_suite = cipher_suite;
         self
     }
 
@@ -128,37 +147,42 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
             verifier: self.state.verifier,
             signing_identity,
             signer,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: self.state.cipher_suite,
             group_state_storage: self.state.session_store,
         })
     }
 
-    /// Generate a fresh Ed25519 key and use a Basic credential with the given identifier.
+    /// Generate a fresh signing key (of the scheme matching the selected suite) and use a Basic
+    /// credential with the given identifier.
     pub fn with_generated_basic_credential(self, name: &[u8]) -> Result<Arc<ClientConfig>, Error> {
-        let (signer, public) = generate_signature_key()?;
-        let signing_identity =
-            SigningIdentity::new(BasicCredential::new(name.to_vec()).into_credential(), public);
+        let (signer, public) = generate_signature_key(self.state.cipher_suite)?;
+        let signing_identity = SigningIdentity::new(
+            BasicCredential::new(name.to_vec()).into_credential(),
+            public,
+        );
         Ok(Arc::new(ClientConfig {
             verifier: self.state.verifier,
             signing_identity,
             signer,
-            cipher_suite: CIPHER_SUITE,
+            cipher_suite: self.state.cipher_suite,
             group_state_storage: self.state.session_store,
         }))
     }
 }
 
-/// Generate a signature keypair for the default cipher suite (ECDSA-P384 for X-Wing).
-pub(crate) fn generate_signature_key() -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
+/// Generate a signature keypair for `cipher_suite` using the compiled crypto backend. Returns
+/// `Error::Unsupported` if the backend does not support the suite (e.g. X-Wing under `openssl`).
+pub(crate) fn generate_signature_key(
+    cipher_suite: CipherSuite,
+) -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
     let csp = MlsTlsCryptoProvider::new()
-        .cipher_suite_provider(CIPHER_SUITE)
+        .cipher_suite_provider(cipher_suite)
         .ok_or(Error::Unsupported("cipher suite unavailable"))?;
     csp.signature_key_generate()
         .map_err(|_| Error::Unsupported("signature key generation failed"))
 }
 
-/// A single MLS-TLS client connection (the initiator). Deref's to [`ConnectionCommon`] for the
-/// sans-I/O byte pipeline.
+/// A single MLS-TLS client connection (the initiator). Deref's to [`ConnectionCommon`].
 pub struct ClientConnection {
     inner: ConnectionCommon,
 }
@@ -184,9 +208,10 @@ impl ClientConnection {
     }
 
     /// Resume a previously-established session over a fresh transport, using a [`ResumptionState`]
-    /// exported earlier (via `ConnectionCommon::export_resumption_state`). The group is reloaded from
-    /// the config's session store, so `config` must share the store used by the original connection
-    /// (reuse the same `Arc<ClientConfig>`). Emits a ResumptionRequest; drive to completion as usual.
+    /// exported earlier (via `ConnectionCommon::export_resumption_state`). The group is reloaded
+    /// from the config's session store, so `config` must share the store used by the original
+    /// connection (reuse the same `Arc<ClientConfig>`). Emits a Resumption request; drive to
+    /// completion as usual.
     pub fn resume(
         config: Arc<ClientConfig>,
         server_name: ServerName<'static>,
@@ -194,8 +219,8 @@ impl ClientConnection {
     ) -> Result<Self, Error> {
         // Reload the persisted group, create + merge a self-update commit (advancing to the new
         // epoch), and build the fresh record layer. The connection then sends a Resumption and awaits
-        // the server's ConnectionConfirmation. The server's identity was pinned at the original
-        // handshake, so `server_name` is not re-checked here.
+        // the server's ConnectionConfirmation. The fresh server pre-handshake key is checked against
+        // the responder identity persisted in the group before the Resumption is sent.
         let client = build_mls_client(
             config.signing_identity.clone(),
             config.signer.clone(),
@@ -205,10 +230,16 @@ impl ClientConnection {
         let mut group = client.load_group(&state.group_id)?;
         let mut two_party = Mls2Party::new(Role::Initiator);
         let commit = two_party.create_resumption_and_merge(&mut group)?;
-        let record = create_record_layer(&group, Side::Client);
+        let record = create_record_layer(&group, Side::Client)?;
         group.write_to_storage()?;
-        let inner =
-            ConnectionCommon::new_client_resuming(group, record, two_party, server_name, commit)?;
+        let inner = ConnectionCommon::new_client_resuming(
+            group,
+            record,
+            two_party,
+            config.verifier.clone(),
+            server_name,
+            commit,
+        )?;
         Ok(Self { inner })
     }
 }

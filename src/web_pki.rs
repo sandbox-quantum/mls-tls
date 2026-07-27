@@ -1,4 +1,3 @@
-#![allow(dead_code)] // WebPkiIdentityProvider/PeerValidation retained for a future symmetric all-X.509 deployment (PUBLIC_API_DESIGN.md §3); peer auth is currently manual via validate_*_credential
 use std::{convert::Infallible, time::Duration};
 
 use mls_rs::{
@@ -13,6 +12,10 @@ use rustls_pki_types::{CertificateDer, InvalidDnsNameError, ServerName, TrustAnc
 pub enum WebPkiIdentityError {
     #[error("credential is not an X.509 certificate")]
     NotX509,
+    #[error("unsupported client credential type: {0}")]
+    UnsupportedClientCredential(&'static str),
+    #[error("external senders are not supported")]
+    UnsupportedExternalSender,
     #[error("X.509 certificate chain is empty")]
     EmptyChain,
     #[error("failed to parse end-entity certificate")]
@@ -81,7 +84,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
         &self,
         signing_identity: &SigningIdentity,
         timestamp: Option<mls_rs::time::MlsTime>,
-        _context: MemberValidationContext<'_>, // TODO: Need to check that properly
+        _context: MemberValidationContext<'_>,
     ) -> Result<(), Self::Error> {
         let chain = signing_identity
             .credential
@@ -90,7 +93,8 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
 
         let leaf_der = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
         let leaf_cert_der = CertificateDer::from(leaf_der.as_ref());
-        let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der).map_err(WebPkiIdentityError::ParseCert)?;
+        let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der)
+            .map_err(WebPkiIdentityError::ParseCert)?;
 
         let intermediates: Vec<CertificateDer> = chain
             .iter()
@@ -131,7 +135,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
         _timestamp: Option<mls_rs::time::MlsTime>,
         _extensions: Option<&ExtensionList>,
     ) -> Result<(), Self::Error> {
-        unimplemented!("MLS+TLS has no external sender.")
+        Err(WebPkiIdentityError::UnsupportedExternalSender)
     }
 
     fn identity(
@@ -144,8 +148,7 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
             .as_x509()
             .ok_or(WebPkiIdentityError::NotX509)?;
         let leaf = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
-        // IMPLEMENTOR NOTE: What identifier should be used with MLS+TLS when using X509?
-        // should this be specified?
+        // The leaf certificate bytes are the stable identity handle for X.509 members.
         Ok(leaf.to_vec())
     }
 
@@ -163,16 +166,18 @@ impl<'a> IdentityProvider for WebPkiIdentityProvider<'a> {
     }
 }
 
-
-
 pub fn validate_client_credential(
     signing_identity: &SigningIdentity,
 ) -> Result<(), WebPkiIdentityError> {
     match &signing_identity.credential {
         mls_rs::identity::Credential::Basic(_) => Ok(()),
-        mls_rs::identity::Credential::X509(_certificate_chain) => unimplemented!(),
-        mls_rs::identity::Credential::Custom(_custom_credential) => unimplemented!(),
-        _ => unimplemented!(),
+        mls_rs::identity::Credential::X509(_) => {
+            Err(WebPkiIdentityError::UnsupportedClientCredential("x509"))
+        }
+        mls_rs::identity::Credential::Custom(_) => {
+            Err(WebPkiIdentityError::UnsupportedClientCredential("custom"))
+        }
+        _ => Err(WebPkiIdentityError::UnsupportedClientCredential("unknown")),
     }
 }
 
@@ -188,7 +193,8 @@ pub fn validate_server_credential(
 
     let leaf_der = chain.leaf().ok_or(WebPkiIdentityError::EmptyChain)?;
     let leaf_cert_der = CertificateDer::from(leaf_der.as_ref());
-    let ee_cert = webpki::EndEntityCert::try_from(&leaf_cert_der).map_err(WebPkiIdentityError::ParseCert)?;
+    let ee_cert =
+        webpki::EndEntityCert::try_from(&leaf_cert_der).map_err(WebPkiIdentityError::ParseCert)?;
 
     let intermediates: Vec<CertificateDer> = chain
         .iter()
@@ -209,7 +215,9 @@ pub fn validate_server_credential(
         .map_err(WebPkiIdentityError::ChainValidation)?;
 
     if let Some(server_name) = expected_name {
-        ee_cert.verify_is_valid_for_subject_name(server_name).map_err(WebPkiIdentityError::NameValidation)?;
+        ee_cert
+            .verify_is_valid_for_subject_name(server_name)
+            .map_err(WebPkiIdentityError::NameValidation)?;
     }
 
     Ok(())
@@ -272,6 +280,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
+    use mls_rs::identity::basic::BasicCredential;
     use mls_rs::identity::x509::{CertificateChain, DerCertificate};
     use mls_rs_core::identity::MemberValidationContext;
     use rcgen::KeyPair;
@@ -301,6 +310,16 @@ mod tests {
             SignatureSecretKey::new(signing_key.to_keypair_bytes().to_vec()),
             SignaturePublicKey::new(signing_key.verifying_key().to_bytes().to_vec()),
         )
+    }
+
+    #[test]
+    fn basic_client_credential_is_accepted() {
+        let identity = SigningIdentity::new(
+            BasicCredential::new(b"client".to_vec()).into_credential(),
+            SignaturePublicKey::new(vec![1, 2, 3]),
+        );
+
+        validate_client_credential(&identity).unwrap();
     }
 
     #[test]

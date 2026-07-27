@@ -1,4 +1,4 @@
-//! The sans-I/O connection core, speaking the Python `mls-tls-python-pedantic` wire protocol.
+//! The sans-I/O connection core.
 //!
 //! Everything rides outer transport frames (content type `0x17`). The message sequence is:
 //! 1. server → client: the server's raw signing public key (pre-handshake);
@@ -71,7 +71,7 @@ enum HsState {
 
 /// Client handshake context, retained until the handshake completes.
 pub(crate) struct ClientCtx {
-    pub(crate) client: MlsClient,
+    pub(crate) client: Option<MlsClient>,
     pub(crate) verifier: ServerCertVerifier,
     pub(crate) server_name: ServerName<'static>,
     /// The ClientHello (KeyPackage) to send once the server pubkey arrives.
@@ -108,7 +108,7 @@ pub struct ConnectionCommon {
 
 impl ConnectionCommon {
     /// Construct a fresh client core. It waits for the server's pre-handshake public key before
-    /// sending its ClientHello (matching the Python peer's ordering).
+    /// sending its ClientHello.
     pub(crate) fn new_client(
         client: MlsClient,
         verifier: ServerCertVerifier,
@@ -122,7 +122,7 @@ impl ConnectionCommon {
             record: None,
             two_party: None,
             client_ctx: Some(ClientCtx {
-                client,
+                client: Some(client),
                 verifier,
                 server_name,
                 pending_client_hello: client_hello_kp,
@@ -144,6 +144,7 @@ impl ConnectionCommon {
         group: MlsGroup,
         record: RecordLayer,
         two_party: Mls2Party,
+        verifier: ServerCertVerifier,
         server_name: ServerName<'static>,
         request_commit: MlsMessage,
     ) -> Result<Self, Error> {
@@ -154,8 +155,8 @@ impl ConnectionCommon {
             record: Some(record),
             two_party: Some(two_party),
             client_ctx: Some(ClientCtx {
-                client: placeholder_client(),
-                verifier: ServerCertVerifier::None,
+                client: None,
+                verifier,
                 server_name,
                 pending_client_hello: request_commit.clone(),
                 server_pubkey: None,
@@ -171,7 +172,11 @@ impl ConnectionCommon {
 
     /// Construct a server core: queue the server's public key and await the ClientHello.
     pub(crate) fn new_server(server_ctx: ServerCtx) -> Result<Self, Error> {
-        let pubkey = server_ctx.signing_identity.signature_key.as_bytes().to_vec();
+        let pubkey = server_ctx
+            .signing_identity
+            .signature_key
+            .as_bytes()
+            .to_vec();
         let mut sendable_tls = VecDeque::new();
         sendable_tls.extend(frame_transport(&pubkey));
         Ok(Self {
@@ -250,7 +255,7 @@ impl ConnectionCommon {
         self.state != HsState::Established
     }
 
-    /// Snapshot the current group for cross-connection resumption.
+    /// Persist the current group and return the state needed to resume it later.
     pub fn export_resumption_state(&mut self) -> Result<ResumptionState, Error> {
         let group = self
             .group
@@ -282,6 +287,16 @@ impl ConnectionCommon {
         ctx.server_pubkey = Some(payload);
 
         if let Some(commit) = self.resumption_commit.take() {
+            let group = self
+                .group
+                .as_ref()
+                .ok_or(Error::UnexpectedMessage("resume without group"))?;
+            verify_server(
+                group,
+                &ctx.verifier,
+                &ctx.server_name,
+                ctx.server_pubkey.as_deref(),
+            )?;
             // Resumption: send a Resumption envelope instead of a ClientHello.
             let bytes = Envelope::Resumption(commit).encode()?;
             self.sendable_tls.extend(frame_transport(&bytes));
@@ -320,12 +335,19 @@ impl ConnectionCommon {
             .take()
             .ok_or(Error::UnexpectedMessage("unexpected ServerHello"))?;
 
-        let mut group =
-            initial_key_agreement_initiator_2(&ctx.client, ServerHello { welcome })?;
+        let client = ctx.client.as_ref().ok_or(Error::UnexpectedMessage(
+            "ServerHello without client context",
+        ))?;
+        let mut group = initial_key_agreement_initiator_2(client, ServerHello { welcome })?;
 
-        verify_server(&group, &ctx.verifier, &ctx.server_name, ctx.server_pubkey.as_deref())?;
+        verify_server(
+            &group,
+            &ctx.verifier,
+            &ctx.server_name,
+            ctx.server_pubkey.as_deref(),
+        )?;
 
-        let record = create_record_layer(&group, Side::Client);
+        let record = create_record_layer(&group, Side::Client)?;
         group.write_to_storage()?;
 
         self.group = Some(group);
@@ -354,7 +376,7 @@ impl ConnectionCommon {
                     ctx.cipher_suite,
                     ctx.storage,
                 )?;
-                let record = create_record_layer(&group, Side::Server);
+                let record = create_record_layer(&group, Side::Server)?;
                 group.write_to_storage()?;
 
                 // ServerHello is a bare MLSMessage(Welcome) — no envelope.
@@ -369,7 +391,7 @@ impl ConnectionCommon {
             }
             Envelope::Resumption(commit) => {
                 // Reload the group named by the commit, apply the initiator's update, and reply with
-                // a bare ConnectionConfirmation (the reference/Python model — no responder commit).
+                // a bare ConnectionConfirmation (the reference model — no responder commit).
                 let group_id = commit
                     .group_id()
                     .ok_or(Error::Decode("resumption commit missing group id"))?
@@ -384,7 +406,7 @@ impl ConnectionCommon {
                 let mut two_party = Mls2Party::new(Role::Responder);
                 let new_epoch = two_party.apply_resumption(&mut group, commit)?;
 
-                let record = create_record_layer(&group, Side::Server);
+                let record = create_record_layer(&group, Side::Server)?;
                 group.write_to_storage()?;
 
                 self.send_signaling(Signaling::ConnectionConfirmation(new_epoch))?;
@@ -400,10 +422,9 @@ impl ConnectionCommon {
 
     fn on_established(&mut self, payload: Vec<u8>) -> Result<(), Error> {
         if is_app_data(&payload) {
-            let record = self
-                .record
-                .as_mut()
-                .ok_or(Error::UnexpectedMessage("application data before handshake"))?;
+            let record = self.record.as_mut().ok_or(Error::UnexpectedMessage(
+                "application data before handshake",
+            ))?;
             let plaintext: TlsPlaintext = record.decrypt(&payload)?;
             match plaintext.content_type {
                 ContentType::ApplicationData => {
@@ -424,8 +445,7 @@ impl ConnectionCommon {
 
     // --- explicit control ---
 
-    /// Explicitly initiate a rekey by sending a `ConnectionUpdate` (analog of rustls'
-    /// `refresh_traffic_keys`). Inbound handling of the resulting control is automatic.
+    /// Explicitly initiate a rekey by sending a `ConnectionUpdate`. Inbound handling of the resulting control is automatic.
     pub fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
         let crypto = MlsTlsCryptoProvider::new();
         let group = self
@@ -535,25 +555,6 @@ impl ConnectionCommon {
         }
         Ok(())
     }
-}
-
-/// A throwaway `MlsClient` held (never used) by a resuming connection's `ClientCtx`, which operates
-/// entirely on its reloaded group.
-fn placeholder_client() -> MlsClient {
-    use mls_rs::identity::basic::BasicCredential;
-    use mls_rs::{CipherSuiteProvider, CryptoProvider};
-    let csp = MlsTlsCryptoProvider::new()
-        .cipher_suite_provider(crate::crypto::XWING_CIPHER_SUITE)
-        .expect("x-wing suite");
-    let (secret, public) = csp.signature_key_generate().expect("keygen");
-    let identity =
-        SigningIdentity::new(BasicCredential::new(b"resume".to_vec()).into_credential(), public);
-    crate::mls_config::build_mls_client(
-        identity,
-        secret,
-        crate::crypto::XWING_CIPHER_SUITE,
-        InMemoryGroupStateStorage::default(),
-    )
 }
 
 /// Verify the server's credential per policy plus the pre-handshake public-key binding.

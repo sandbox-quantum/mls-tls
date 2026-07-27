@@ -1,11 +1,18 @@
-//! `mls-tls` — a rustls-shaped public API over the 2PMLS + MLS-TLS IETF drafts.
+//! `mls-tls` — a public API over the 2PMLS + MLS-TLS IETF drafts.
 //!
 //! An MLS group (via `mls-rs`) is used as the key-agreement engine feeding a TLS 1.3 record layer.
-//! See `PUBLIC_API_DESIGN.md` for the full design. The public surface is built up across phases;
-//! this is the library skeleton plus the internal building blocks.
+
+// Exactly one crypto backend must be selected at compile time; the two are mutually exclusive.
+#[cfg(all(feature = "rustcrypto", feature = "openssl"))]
+compile_error!(
+    "features `rustcrypto` and `openssl` are mutually exclusive — enable exactly one \
+     (for OpenSSL use `--no-default-features --features openssl`)"
+);
+#[cfg(not(any(feature = "rustcrypto", feature = "openssl")))]
+compile_error!("enable exactly one crypto backend feature: `rustcrypto` (default) or `openssl`");
 
 pub(crate) mod crypto;
-pub(crate) mod mls_tls;
+pub(crate) mod mls_tls_01;
 pub(crate) mod mls_two_party_profile_00;
 pub(crate) mod tls_record;
 pub(crate) mod tree_printer;
@@ -25,6 +32,7 @@ mod stream;
 pub use builder::ConfigBuilder;
 pub use client::{ClientConfig, ClientConnection, ServerCertVerifier};
 pub use conn::{Connection, ConnectionCommon, IoState, Reader, Writer};
+pub use crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
 pub use error::Error;
 pub use resumption::{ResumptionState, SessionStore};
 pub use server::{ClientCertVerifier, ServerConfig, ServerConnection};
@@ -40,7 +48,9 @@ pub use tls_record::Role as Side;
 
 // --- internal imports for the crate-root handshake helpers ---
 use mls_rs::{
-    Client, CryptoProvider, Group, client_builder::MlsConfig, error::MlsError,
+    Client, CryptoProvider, Group,
+    client_builder::MlsConfig,
+    error::MlsError,
     storage_provider::in_memory::{
         InMemoryGroupStateStorage, InMemoryKeyPackageStorage, InMemoryPreSharedKeyStorage,
     },
@@ -77,29 +87,28 @@ pub(crate) fn make_client<C: CryptoProvider + Clone>(
 /// Derive both application-traffic secrets from `mls_group` and build the record layer for `role`.
 ///
 /// Suite parameters (hash + AEAD) follow the group's cipher suite; the `<c|s> ap traffic` context is
-/// the 64-zero-byte handshake-hash placeholder at epoch 1 and empty afterwards (matching the Python).
+/// the 64-zero-byte handshake-hash placeholder at epoch 1 and empty afterwards.
 pub(crate) fn create_record_layer(
     mls_group: &Group<impl MlsConfig>,
     role: tls_record::Role,
-) -> tls_record::RecordLayer {
+) -> Result<tls_record::RecordLayer, Error> {
     let crypto = MlsTlsCryptoProvider::new();
     let client_ts =
-        mls_tls::derive_client_application_traffic_secret(mls_group, crypto.clone()).unwrap();
-    let server_ts =
-        mls_tls::derive_server_application_traffic_secret(mls_group, crypto).unwrap();
+        mls_tls_01::derive_client_application_traffic_secret(mls_group, crypto.clone())?;
+    let server_ts = mls_tls_01::derive_server_application_traffic_secret(mls_group, crypto)?;
 
-    let params = tls_record::SuiteParams::for_cipher_suite(mls_group.cipher_suite().into());
+    let params = tls_record::SuiteParams::for_cipher_suite(mls_group.cipher_suite().into())?;
     // Only ever called to build a *fresh* codec — at the initial handshake and at resumption (both
     // over a new transport) — so it always uses the epoch-1 `<c|s> ap traffic` context (the 64-zero
     // handshake-hash placeholder). Per-epoch rekeys on a live transport go through
     // `RecordLayer::apply_rekey`, which uses the empty context.
-    tls_record::RecordLayer::from_traffic_secrets(
+    Ok(tls_record::RecordLayer::from_traffic_secrets(
         params,
         client_ts.as_bytes(),
         server_ts.as_bytes(),
         role,
         true,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -153,7 +162,8 @@ mod tests {
             .unwrap();
         let mut server = ServerConnection::new(server_config).unwrap();
         let mut client =
-            ClientConnection::new(client_config, ServerName::try_from("localhost").unwrap()).unwrap();
+            ClientConnection::new(client_config, ServerName::try_from("localhost").unwrap())
+                .unwrap();
         drive(&mut client, &mut server);
         assert!(!client.is_handshaking(), "client still handshaking");
         assert!(!server.is_handshaking(), "server still handshaking");
@@ -172,8 +182,14 @@ mod tests {
     #[test]
     fn loopback_handshake_and_appdata() {
         let (mut client, mut server) = established_pair();
-        assert_eq!(send(&mut client, &mut server, b"hello server"), b"hello server");
-        assert_eq!(send(&mut server, &mut client, b"hello client"), b"hello client");
+        assert_eq!(
+            send(&mut client, &mut server, b"hello server"),
+            b"hello server"
+        );
+        assert_eq!(
+            send(&mut server, &mut client, b"hello client"),
+            b"hello client"
+        );
     }
 
     #[test]
@@ -193,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn loopback_cross_connection_resumption() {
+    fn loopback_resumption() {
         use crate::client::ClientConfig;
         use crate::server::ServerConfig;
 
@@ -211,8 +227,7 @@ mod tests {
 
         // Connection 1: fresh handshake + app data at epoch 1.
         let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
-        let mut client1 =
-            ClientConnection::new(client_config.clone(), name.clone()).unwrap();
+        let mut client1 = ClientConnection::new(client_config.clone(), name.clone()).unwrap();
         for _ in 0..8 {
             let a = pump(&mut server1, &mut client1);
             let b = pump(&mut client1, &mut server1);
@@ -235,9 +250,77 @@ mod tests {
                 break;
             }
         }
-        assert!(!client2.is_handshaking(), "resumed client still handshaking");
-        assert!(!server2.is_handshaking(), "resumed server still handshaking");
+        assert!(
+            !client2.is_handshaking(),
+            "resumed client still handshaking"
+        );
+        assert!(
+            !server2.is_handshaking(),
+            "resumed server still handshaking"
+        );
         assert_eq!(send(&mut client2, &mut server2, b"epoch2"), b"epoch2");
-        assert_eq!(send(&mut server2, &mut client2, b"epoch2 back"), b"epoch2 back");
+        assert_eq!(
+            send(&mut server2, &mut client2, b"epoch2 back"),
+            b"epoch2 back"
+        );
+    }
+
+    #[test]
+    fn resumption_rejects_changed_server_identity() {
+        use crate::client::{ClientConfig, generate_signature_key};
+        use crate::server::{ServerConfig, ServerConnection};
+        use mls_rs::identity::{SigningIdentity, basic::BasicCredential};
+        use std::sync::Arc;
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_generated_basic_credential(b"server")
+            .unwrap();
+        let client_config = ClientConfig::builder()
+            .with_no_certificate_verification()
+            .with_generated_basic_credential(b"client")
+            .unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+
+        let mut server1 = ServerConnection::new(server_config.clone()).unwrap();
+        let mut client1 = ClientConnection::new(client_config.clone(), name.clone()).unwrap();
+        drive(&mut client1, &mut server1);
+        assert!(!client1.is_handshaking());
+        let resumption = client1.export_resumption_state().unwrap();
+
+        let (bad_signer, bad_public) = generate_signature_key(server_config.cipher_suite).unwrap();
+        let bad_identity = SigningIdentity::new(
+            BasicCredential::new(b"other-server".to_vec()).into_credential(),
+            bad_public,
+        );
+        let bad_server_config = Arc::new(crate::server::ServerConfig {
+            client_verifier: server_config.client_verifier.clone(),
+            signing_identity: bad_identity,
+            signer: bad_signer,
+            cipher_suite: server_config.cipher_suite,
+            group_state_storage: server_config.group_state_storage.clone(),
+        });
+
+        let mut server2 = ServerConnection::new(bad_server_config).unwrap();
+        let mut client2 = ClientConnection::resume(client_config, name, resumption).unwrap();
+
+        let mut buf = Vec::new();
+        while server2.wants_write() {
+            if server2.write_tls(&mut buf).unwrap() == 0 {
+                break;
+            }
+        }
+        let mut incoming = &buf[..];
+        while !incoming.is_empty() {
+            if client2.read_tls(&mut incoming).unwrap() == 0 {
+                break;
+            }
+        }
+
+        assert!(matches!(
+            client2.process_new_packets().unwrap_err(),
+            crate::error::Error::PeerAuth("server key does not match presented key")
+        ));
+        assert!(!client2.wants_write());
     }
 }

@@ -8,7 +8,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-use mls_tls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, ServerName, StreamOwned};
+use mls_tls::{
+    ClientConfig, ClientConnection, ServerConfig, ServerConnection, ServerName, StreamOwned,
+};
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -50,7 +52,10 @@ fn main() {
 
     let mut buf = [0u8; 256];
     let n = tls.read(&mut buf).unwrap();
-    println!("[client] received: {:?}", String::from_utf8_lossy(&buf[..n]));
+    println!(
+        "[client] received: {:?}",
+        String::from_utf8_lossy(&buf[..n])
+    );
 
     server.join().unwrap();
 }

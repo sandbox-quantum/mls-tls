@@ -18,9 +18,21 @@ fn main() {
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
 
     fs::write(fixtures_dir.join("ca_cert.der"), ca.der().as_ref()).unwrap();
-    fs::write(fixtures_dir.join("server_cert.der"), server_cert.der().as_ref()).unwrap();
-    fs::write(fixtures_dir.join("server_secret_key.bin"), &signing_key.to_keypair_bytes()).unwrap();
-    fs::write(fixtures_dir.join("server_public_key.bin"), &signing_key.verifying_key().to_bytes()).unwrap();
+    fs::write(
+        fixtures_dir.join("server_cert.der"),
+        server_cert.der().as_ref(),
+    )
+    .unwrap();
+    fs::write(
+        fixtures_dir.join("server_secret_key.bin"),
+        &signing_key.to_keypair_bytes(),
+    )
+    .unwrap();
+    fs::write(
+        fixtures_dir.join("server_public_key.bin"),
+        &signing_key.verifying_key().to_bytes(),
+    )
+    .unwrap();
 
     println!("Fixtures written to {}", fixtures_dir.display());
 }

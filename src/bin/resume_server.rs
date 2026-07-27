@@ -1,6 +1,6 @@
-//! Interop server for cross-connection resumption. Accepts two sequential connections that share
-//! one config (hence one Arc-backed session store): the first is a fresh handshake, the second is a
-//! Resumption of the first. Each connection receives one app-data message and replies with an ack.
+//! Interop server for resumption. Accepts two sequential connections that share one config (hence
+//! one Arc-backed session store): the first is a fresh handshake, the second resumes it. Each
+//! connection receives one app-data message and replies with an ack.
 //!
 //! Usage: `resume_server <port>`.
 
@@ -57,7 +57,10 @@ fn handle(config: Arc<ServerConfig>, sock: &mut TcpStream, ack: &[u8]) -> io::Re
 }
 
 fn main() -> io::Result<()> {
-    let port: u16 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8080);
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("listening {port}");
 

@@ -4,7 +4,7 @@
 //! (`TwoPartyError`, `RecordError`, `MlsTlsError`, `WebPkiIdentityError`) plus the sans-I/O
 //! framing/state errors surfaced by the connection.
 
-use crate::mls_tls::MlsTlsError;
+use crate::mls_tls_01::MlsTlsError;
 use crate::mls_two_party_profile_00::TwoPartyError;
 use crate::tls_record::RecordError;
 use crate::web_pki::WebPkiIdentityError;

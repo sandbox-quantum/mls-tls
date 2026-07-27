@@ -1,20 +1,13 @@
-//! Resumption support (Phase 5).
-//!
-//! Two flavours:
-//! - **In-session**: `ConnectionCommon::initiate_resumption()` runs a full re-key-agreement over the
-//!   live group (handled automatically on the peer).
-//! - **Cross-connection**: `ConnectionCommon::export_resumption_state()` snapshots the group into the
-//!   config's [`SessionStore`], and `ClientConnection::resume()` rebuilds a connection from a
-//!   persisted group over a fresh transport.
+//! Resumption support
 //!
 //! The MLS group state is persisted via mls-rs' `GroupStateStorage` (`Group::write_to_storage` +
-//! `Client::load_group`). A [`ResumptionState`] is a lightweight "ticket" naming the persisted group;
-//! the state itself lives in the [`SessionStore`]. Reuse the same config (or share a `SessionStore`)
-//! across the original and resumed connections so the group can be reloaded.
+//! `Client::load_group`). `ConnectionCommon::export_resumption_state()` writes the current group to
+//! the config's [`SessionStore`] and returns a [`ResumptionState`] that names it. Pass that state to
+//! `ClientConnection::resume()` with a config that shares the same store.
 //!
-//! Note: for the same-process / shared-store case a `ResumptionState` carries only the group id. Full
-//! cross-*process* portability would additionally serialize the stored `GroupState`/`EpochRecord`
-//! bytes; that is a documented extension.
+//! A [`ResumptionState`] carries only the group id. The serialized MLS group state remains in the
+//! [`SessionStore`], so resumed connections must use the same config or another config built with a
+//! shared store.
 
 use mls_rs::storage_provider::in_memory::InMemoryGroupStateStorage;
 
@@ -35,14 +28,14 @@ impl SessionStore {
     }
 }
 
-/// A resumption "ticket": identifies the persisted MLS group to resume from.
+/// A handle identifying the persisted MLS group to resume from.
 #[derive(Clone, Debug)]
 pub struct ResumptionState {
     pub(crate) group_id: Vec<u8>,
 }
 
 impl ResumptionState {
-    /// Serialize the ticket (currently just the group id).
+    /// Serialize the resumption handle.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.group_id.clone()
     }
