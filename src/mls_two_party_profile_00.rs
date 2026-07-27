@@ -14,8 +14,8 @@ use mls_rs::{
 use crate::{
     mls_config::{MlsGroup, build_mls_client},
     mls_tls_01::MlsTlsError,
+    pki::{PkiError, validate_client_credential},
     tls_record::DirectionalRekey,
-    web_pki::{WebPkiIdentityError, validate_client_credential},
 };
 
 // draft-kohbrok-mls-two-party-profile-00
@@ -170,7 +170,7 @@ pub enum TwoPartyError {
     #[error("MLS operation failed")]
     Mls(#[from] MlsError),
     #[error("credential validation failed")]
-    CredentialValidation(#[from] WebPkiIdentityError),
+    CredentialValidation(#[from] PkiError),
     #[error("unsupported cipher suite: {0:?}")]
     UnsupportedCipherSuite(CipherSuite),
     #[error("expected a KeyPackage message")]
@@ -525,7 +525,7 @@ impl mls_rs::MlsRules for TwoPartyMlsRules {
 //    } ResumptionResponse
 //
 
-// Below are not used in the reference implementation. 
+// Below are not used in the reference implementation.
 // #[derive(Clone, Debug)]
 // pub(crate) struct ResumptionRequest {
 //     pub(crate) commit: MlsMessage,

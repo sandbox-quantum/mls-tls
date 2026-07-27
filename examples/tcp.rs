@@ -13,6 +13,11 @@ use mls_tls::{
 };
 
 fn main() {
+    // A `fips` build refuses to open a connection until the FIPS providers are loaded, and this
+    // must happen before any other OpenSSL use — hence the very first line of `main`.
+    #[cfg(feature = "fips")]
+    mls_tls::fips::enable().expect("FIPS mode could not be activated");
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 

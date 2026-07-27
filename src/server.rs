@@ -1,7 +1,7 @@
 //! Server-side configuration: `ServerConfig` + its typestate builder stages, and `ServerConnection`.
 //!
 //! `client_verifier` is the policy for how the server checks the **client's** credential from the
-//! incoming KeyPackage (consumed by `web_pki::validate_client_credential` at the handshake, not the
+//! incoming KeyPackage (consumed by `pki::validate_client_credential` at the handshake, not the
 //! mls-rs identity provider).
 
 use std::ops::{Deref, DerefMut};
@@ -13,7 +13,7 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential, x509::CertificateChain},
     storage_provider::in_memory::InMemoryGroupStateStorage,
 };
-use rustls_pki_types::TrustAnchor;
+use rustls_pki_types::CertificateDer;
 
 use crate::builder::ConfigBuilder;
 use crate::client::{CIPHER_SUITE, generate_signature_key};
@@ -25,12 +25,10 @@ use crate::error::Error;
 pub enum ClientCertVerifier {
     /// Accept a Basic client credential (no client PKI). This is the common web-like case.
     Basic,
-    /// Require and validate a client X.509 certificate against these anchors.
+    /// Require and validate a client X.509 certificate against these root certificates (DER).
     ///
     /// Not yet implemented end-to-end — selecting this surfaces `Error::Unsupported` at handshake.
-    WebPki {
-        trust_anchors: Vec<TrustAnchor<'static>>,
-    },
+    Roots(Vec<CertificateDer<'static>>),
 }
 
 /// Immutable, `Arc`-shareable server configuration. Build with [`ServerConfig::builder`].
@@ -66,14 +64,12 @@ impl ConfigBuilder<ServerConfig, WantsClientVerifier> {
         ConfigBuilder::new(WantsServerCredential::new(ClientCertVerifier::Basic))
     }
 
-    /// Require a client X.509 certificate validated against the given anchors.
+    /// Require a client X.509 certificate validated against the given root certificates (DER).
     pub fn with_client_cert_verifier(
         self,
-        trust_anchors: Vec<TrustAnchor<'static>>,
+        roots: Vec<CertificateDer<'static>>,
     ) -> ConfigBuilder<ServerConfig, WantsServerCredential> {
-        ConfigBuilder::new(WantsServerCredential::new(ClientCertVerifier::WebPki {
-            trust_anchors,
-        }))
+        ConfigBuilder::new(WantsServerCredential::new(ClientCertVerifier::Roots(roots)))
     }
 }
 
@@ -165,6 +161,9 @@ impl ServerConnection {
     /// Start a server connection. It queues the server's public key immediately; drive the handshake
     /// by pumping `write_tls` / `read_tls` + `process_new_packets` until `is_handshaking()` is false.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+        #[cfg(feature = "fips")]
+        crate::fips::assert_enabled()?;
+
         let server_ctx = ServerCtx {
             signing_identity: config.signing_identity.clone(),
             signer: config.signer.clone(),

@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+# Interop scratch: the Python venv and ephemeral generated fixtures. The deterministic
+# KAT vectors (interop/kat_vectors.json) are intentionally NOT ignored so they can be committed.
+/interop/.venv
+/interop/*.bin

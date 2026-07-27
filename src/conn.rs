@@ -38,10 +38,10 @@ use crate::mls_two_party_profile_00::{
     ClientHello, ConnectionUpdate, EpochKeyUpdate, Mls2Party, Role, ServerHello,
     initial_key_agreement_initiator_2, initial_key_agreement_responder_1,
 };
+use crate::pki::{RootSource, validate_server_credential};
 use crate::resumption::ResumptionState;
 use crate::server::ClientCertVerifier;
 use crate::tls_record::{ContentType, DirectionalRekey, RecordLayer, Role as Side, TlsPlaintext};
-use crate::web_pki::validate_server_credential;
 
 /// Summary of the connection's I/O state after [`ConnectionCommon::process_new_packets`].
 #[derive(Debug, Clone, Copy)]
@@ -366,7 +366,7 @@ impl ConnectionCommon {
 
         match envelope {
             Envelope::ClientHello(key_package) => {
-                if let ClientCertVerifier::WebPki { .. } = ctx.client_verifier {
+                if let ClientCertVerifier::Roots(_) = ctx.client_verifier {
                     return Err(Error::Unsupported("client certificate verification"));
                 }
                 let (server_hello, mut group) = initial_key_agreement_responder_1(
@@ -532,7 +532,7 @@ impl ConnectionCommon {
 
     fn apply_directional_rekey(&mut self, rekey: DirectionalRekey) -> Result<(), Error> {
         let side = self.side;
-        self.record_mut()?.apply_rekey(rekey, side);
+        self.record_mut()?.apply_rekey(rekey, side)?;
         if let Some(group) = self.group.as_mut() {
             group.write_to_storage().ok();
         }
@@ -578,8 +578,16 @@ fn verify_server(
 
     match verifier {
         ServerCertVerifier::None => Ok(()),
-        ServerCertVerifier::WebPki { trust_anchors } => {
-            validate_server_credential(signing_identity, trust_anchors, Some(server_name))?;
+        ServerCertVerifier::Roots(roots) => {
+            validate_server_credential(
+                signing_identity,
+                RootSource::Explicit(roots),
+                Some(server_name),
+            )?;
+            Ok(())
+        }
+        ServerCertVerifier::DefaultRoots => {
+            validate_server_credential(signing_identity, RootSource::Default, Some(server_name))?;
             Ok(())
         }
     }

@@ -10,6 +10,12 @@
 //! Because exactly one backend is compiled, the HPKE context types are uniform
 //! (`ContextS/R<Kdf, Aead>` of the active backend) and no cross-backend bridging is needed.
 //!
+//! This provider is also the crate's *single* crypto boundary: the TLS record layer
+//! ([`crate::tls_record`]) derives its keys and protects its records through
+//! [`MlsTlsCipherSuiteProvider`] rather than reaching for primitives of its own. That is what makes
+//! `fips` meaningful — routing everything here means one place governs which algorithms are
+//! reachable, and under `fips` that place is the OpenSSL FIPS provider.
+//!
 //! [`XWingCipherSuite`] implements [`CipherSuiteProvider`] by:
 //! - running HPKE through `mls-rs-crypto-hpke`'s `Hpke` with our [`XWingKem`] and an **HKDF-SHA384**
 //!   KDF + AES-256-GCM AEAD (the RFC-9180 base-mode side, matching the Python `crypto/hpke.py`),
@@ -562,8 +568,29 @@ impl CipherSuiteProvider for MlsTlsCipherSuiteProvider {
     }
 }
 
+/// The MLS cipher suites whose every primitive is FIPS-approved.
+///
+/// The other four standard suites are excluded for concrete reasons, not caution:
+/// - `CURVE25519_*` (0x0001, 0x0003) and `CURVE448_*` (0x0004, 0x0006) rest on X25519/X448 key
+///   agreement. Those curves are in SP 800-186 but not SP 800-56Arev3, and the FIPS provider
+///   flags their key management as **unapproved** — even though Ed25519/Ed448 *signatures* are
+///   approved. The KEM is what disqualifies them.
+/// - `*_CHACHA` (0x0003, 0x0006) additionally need ChaCha20-Poly1305, which the FIPS provider does
+///   not implement at all.
+/// - X-Wing (0x004e) is RustCrypto-only by construction and never reaches this build.
+///
+/// Filtering here rather than at the config layer means every consumer inherits it: signature key
+/// generation, the record layer and the MLS group all resolve suites through
+/// `cipher_suite_provider`, and each already handles `None`.
+#[cfg(feature = "fips")]
+const FIPS_APPROVED_SUITES: &[CipherSuite] = &[
+    CipherSuite::P256_AES128,
+    CipherSuite::P384_AES256,
+    CipherSuite::P521_AES256,
+];
+
 /// The composite [`CryptoProvider`]: the compile-time-selected standard backend, plus (under
-/// `rustcrypto`) the X-Wing suite (`0x004e`).
+/// `rustcrypto`) the X-Wing suite (`0x004e`). Under `fips`, restricted to [`FIPS_APPROVED_SUITES`].
 #[derive(Clone, Default)]
 pub(crate) struct MlsTlsCryptoProvider {
     inner: BackendProvider,
@@ -581,6 +608,8 @@ impl CryptoProvider for MlsTlsCryptoProvider {
     fn supported_cipher_suites(&self) -> Vec<CipherSuite> {
         #[allow(unused_mut)]
         let mut suites = self.inner.supported_cipher_suites();
+        #[cfg(feature = "fips")]
+        suites.retain(|suite| FIPS_APPROVED_SUITES.contains(suite));
         #[cfg(feature = "rustcrypto")]
         suites.push(MLS_256_XWING_AES256GCM_SHA512_P384);
         suites
@@ -590,6 +619,10 @@ impl CryptoProvider for MlsTlsCryptoProvider {
         &self,
         cipher_suite: CipherSuite,
     ) -> Option<Self::CipherSuiteProvider> {
+        #[cfg(feature = "fips")]
+        if !FIPS_APPROVED_SUITES.contains(&cipher_suite) {
+            return None;
+        }
         #[cfg(feature = "rustcrypto")]
         if cipher_suite == MLS_256_XWING_AES256GCM_SHA512_P384 {
             return Some(MlsTlsCipherSuiteProvider::XWing(XWingCipherSuite::new()));

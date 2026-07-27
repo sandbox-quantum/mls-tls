@@ -7,39 +7,65 @@ edition = "2024"
 # Compile-time crypto backend selection. Exactly one of `rustcrypto` / `openssl` must be enabled
 # (a `compile_error!` in src/lib.rs enforces this). They are mutually exclusive:
 #   * `rustcrypto` (default): pure-Rust primitives, no system dependency, portable binaries. Includes
-#     the custom X-Wing suite (0x004e) used for the Python interop.
+#     the custom X-Wing suite (0x004e) used for the Python interop, and verifies X.509 chains with
+#     rustls-webpki.
 #   * `openssl`: primitives from the system OpenSSL library (automatic/dynamic linking). Serves the
 #     standard MLS suites only — X-Wing is unavailable and requesting it errors at runtime. Build with
 #     `--no-default-features --features openssl`.
+#
+# `fips` builds on `openssl` and restricts the crate to FIPS-approved operation: every primitive,
+# including the TLS record layer and X.509 chain verification, is served by the OpenSSL FIPS
+# provider, and the non-approved cipher suites are refused. Requires OpenSSL 3.5+ and a FIPS module,
+# and the application must call `mls_tls::fips::enable()` before anything else. Build with
+# `--no-default-features --features fips`. See `docker/fips/` for a working environment.
+#
+# Note that cargo features are additive: `--features fips` *without* `--no-default-features` also
+# enables `rustcrypto` and trips the mutual-exclusion `compile_error!`.
 default = ["rustcrypto"]
-rustcrypto = ["dep:mls-rs-crypto-rustcrypto", "dep:ml-kem", "dep:sha3", "dep:p384", "dep:rand_core"]
-openssl = ["dep:mls-rs-crypto-openssl"]
+rustcrypto = [
+    "dep:mls-rs-crypto-rustcrypto",
+    "dep:ml-kem",
+    "dep:sha3",
+    "dep:p384",
+    "dep:rand_core",
+    "dep:rustls-webpki",
+    "dep:webpki-roots",
+]
+openssl = ["dep:mls-rs-crypto-openssl", "dep:openssl", "dep:openssl-sys"]
+fips = ["openssl"]
 
 [dependencies]
 mls-rs = { version = "0.55.2", features = ["x509"] }
 mls-rs-core = "0.27.0"
-rustls-pki-types = "1.14.1"
-rustls-webpki = { version = "0.103.13", features = ["ring"] }
-webpki-roots = "1.0.8"
-aes-gcm = "0.10"
-chacha20poly1305 = "0.10"
-hkdf = "0.12"
-sha2 = "0.10"
+rustls-pki-types = { version = "1.14.1", features = ["std"] }
 hex = "0.4.3"
 thiserror = "2"
 mls-rs-crypto-hpke = "0.21.0"
 mls-rs-crypto-traits = "0.22.0"
 zeroize = "1"
 
-# Backend + X-Wing crates, enabled by the `rustcrypto` feature.
+# Backend + X-Wing crates, enabled by the `rustcrypto` feature. rustls-webpki pulls in `ring`, which
+# is outside any FIPS boundary, so the webpki path is confined to this backend; the `openssl`
+# backend verifies chains with OpenSSL instead.
 mls-rs-crypto-rustcrypto = { version = "0.22.0", optional = true }
 ml-kem = { version = "0.3.2", optional = true }
 sha3 = { version = "0.10", optional = true }
 p384 = { version = "0.13", features = ["ecdh", "ecdsa", "alloc"], optional = true }
 rand_core = { version = "0.6", optional = true }
+rustls-webpki = { version = "0.103.13", features = ["ring"], optional = true }
+webpki-roots = { version = "1.0.8", optional = true }
 
-# Backend crate, enabled by the `openssl` feature.
+# Backend crates, enabled by the `openssl` feature. `openssl-sys` is needed for the two FIPS calls
+# the safe wrapper does not expose (`EVP_default_properties_{enable,is}_fips*`); it declares
+# `links = "openssl"`, so cargo guarantees a single version shared with mls-rs-crypto-openssl.
 mls-rs-crypto-openssl = { version = "0.21.0", optional = true }
+openssl = { version = "0.10.81", optional = true }
+openssl-sys = { version = "0.9", optional = true }
+
+# Produces the Ed25519 interop fixtures with rcgen; meaningless (and non-approved) under `fips`.
+[[example]]
+name = "generate_fixtures"
+required-features = ["rustcrypto"]
 
 [dev-dependencies]
 rcgen = "0.14"

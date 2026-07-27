@@ -40,6 +40,11 @@ fn send(from: &mut ConnectionCommon, to: &mut ConnectionCommon, msg: &str) {
 }
 
 fn main() {
+    // A `fips` build refuses to open a connection until the FIPS providers are loaded, and this
+    // must happen before any other OpenSSL use — hence the very first line of `main`.
+    #[cfg(feature = "fips")]
+    mls_tls::fips::enable().expect("FIPS mode could not be activated");
+
     let client_config: Arc<ClientConfig> = ClientConfig::builder()
         .with_no_certificate_verification()
         .with_generated_basic_credential(b"client")

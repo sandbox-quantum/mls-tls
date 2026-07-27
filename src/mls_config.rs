@@ -11,7 +11,7 @@
 //! - identity provider: [`PassThroughIdentityProvider`] — **always accept-all**. mls-rs applies the
 //!   group's single identity provider symmetrically to every member, but peer authentication here is
 //!   asymmetric/directional (a Basic client can talk to an X.509 server), so it cannot be a strict
-//!   provider. Real peer verification is done manually at the handshake (see `web_pki` +
+//!   provider. Real peer verification is done manually at the handshake (see `pki` +
 //!   `initial_key_agreement_*`).
 //!
 //! Because all six `Config` type parameters are fixed, `Group<MlsTlsConfig>` is nameable and ownable.
@@ -26,7 +26,7 @@ use mls_rs::{
 
 use crate::crypto::provider::MlsTlsCryptoProvider;
 use crate::mls_two_party_profile_00::TwoPartyMlsRules;
-use crate::web_pki::PassThroughIdentityProvider;
+use crate::pki::PassThroughIdentityProvider;
 
 /// The one concrete MLS configuration. All `With*` aliases resolve to the same
 /// `Config<InMemoryKeyPackageStorage, InMemoryPreSharedKeyStorage, InMemoryGroupStateStorage,
@@ -84,6 +84,7 @@ mod tests {
 
     /// Build a Basic-credential signing identity for the given suite (compiled backend).
     fn basic_identity(id: &[u8], cs: CipherSuite) -> (SigningIdentity, SignatureSecretKey) {
+        crate::test_init();
         let csp = MlsTlsCryptoProvider::new()
             .cipher_suite_provider(cs)
             .expect("suite supported");
@@ -159,6 +160,7 @@ mod tests {
     #[cfg(feature = "openssl")]
     #[test]
     fn xwing_unsupported_under_openssl() {
+        crate::test_init();
         let provider = MlsTlsCryptoProvider::new();
         assert!(
             provider

@@ -1,0 +1,180 @@
+{
+  "comment": "Record-layer known-answer vectors. See src/tls_record.rs `mod kat`. Generated from the rustcrypto backend; replayed under every backend.",
+  "plaintexts": {
+    "c2s": [
+      "hello server",
+      "second record from the client"
+    ],
+    "c2s_post_rekey": [
+      "after rekey, client to server"
+    ],
+    "s2c": [
+      "hello client"
+    ],
+    "s2c_post_rekey": [
+      "after rekey, server to client"
+    ]
+  },
+  "vectors": [
+    {
+      "c2s": [
+        "170303001d400d0bd3f6089f7304e4bca634d27843b2e162bd14707fd8376742a055",
+        "170303002ec5d4eb2fb036ff7db2b8a5613e5c4ea6cbea2cba892feb529926f8bf6d8dbdf469250257e382f11293a391ff7bc0"
+      ],
+      "c2s_post_rekey": [
+        "170303002efeee588bbf74df4b1ab7fd4dc1722812dcee0c80a624dfde9a6bd85686f6b4d799cffbf586b1eb9044cde2329e7c"
+      ],
+      "client_secret": "102f4e6d8cabcae90827466584a3c2e1001f3e5d7c9bbad9f81736557493b2d1",
+      "rekey_client_secret": "3251708faecdec0b2a496887a6c5e4032241607f9ebddcfb1a39587796b5d4f3",
+      "rekey_server_secret": "456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e706",
+      "s2c": [
+        "170303001d1ab4989ce42b05a41c3db7170457c18b45b9e6262d2a42eafc0dbfa49c"
+      ],
+      "s2c_post_rekey": [
+        "170303002e0ceb64636c1b93e59c73b7f885bd8ffb5a7292e1e52aa45163e795849c62e79ae17a45baedadc12d8e069a082bcf"
+      ],
+      "server_secret": "234261809fbeddfc1b3a597897b6d5f4133251708faecdec0b2a496887a6c5e4",
+      "suite": 1
+    },
+    {
+      "c2s": [
+        "170303001d62d96fc5823fe1613c06a0e4977f2ae006721d667c6d94c6af4ead7092",
+        "170303002e6e36b70e9e737698d97fd87d52b14a93db736893e4de9c72efd126a134ca3c6416aa2321b6cce6f8d72f1c8499fa"
+      ],
+      "c2s_post_rekey": [
+        "170303002e07e8937041312c0280ca360315610ac816f327b058a0df61a90d885c98ba938a88812f7d37cd1817c28ee1397744"
+      ],
+      "client_secret": "133251708faecdec0b2a496887a6c5e4032241607f9ebddcfb1a39587796b5d4",
+      "rekey_client_secret": "31506f8eadcceb0a29486786a5c4e30221405f7e9dbcdbfa1938577695b4d3f2",
+      "rekey_server_secret": "466584a3c2e1001f3e5d7c9bbad9f81736557493b2d1f00f2e4d6c8baac9e807",
+      "s2c": [
+        "170303001d5e66a0ca44a4725c3db5588e661d63177b8739cd1c4347d62bd4a7b0f6"
+      ],
+      "s2c_post_rekey": [
+        "170303002e65425661d4cfb98ca415b90df651410f29ece875dd38ae3656c752e0b434c380b42ab70547088b25b3210d284914"
+      ],
+      "server_secret": "203f5e7d9cbbdaf91837567594b3d2f1102f4e6d8cabcae90827466584a3c2e1",
+      "suite": 2
+    },
+    {
+      "c2s": [
+        "170303001d60488c4d57243e8c20337e52c9a41cedd4fdfd0125f7064119b9cb4bb7",
+        "170303002ec578a6d688ca3859005653cd42f4c5415929d6b286b6bc75774f4172c308c4f553b14cc95389db42b1ff67629c4f"
+      ],
+      "c2s_post_rekey": [
+        "170303002ecf68c50ea89edbc48f35df59b47d7d6602e19d924b48897451418f7bdf60d61ba342df9d2ea2ce9f7dfab15ca1c2"
+      ],
+      "client_secret": "1231506f8eadcceb0a29486786a5c4e30221405f7e9dbcdbfa1938577695b4d3",
+      "rekey_client_secret": "304f6e8daccbea0928476685a4c3e201203f5e7d9cbbdaf91837567594b3d2f1",
+      "rekey_server_secret": "476685a4c3e201203f5e7d9cbbdaf91837567594b3d2f1102f4e6d8cabcae908",
+      "s2c": [
+        "170303001db1ab8f231d895e311bda045e9d8aa2f2b35f3053f40576f445ecc02009"
+      ],
+      "s2c_post_rekey": [
+        "170303002e3c62b47b02c91032aeff713852029bc88e8944516b8874e4bfe0982eb481ca43a226740cfd32af9396f21f75814e"
+      ],
+      "server_secret": "21405f7e9dbcdbfa1938577695b4d3f211304f6e8daccbea0928476685a4c3e2",
+      "suite": 3
+    },
+    {
+      "c2s": [
+        "170303001d24095f13dd443539b975ff6f78a9680e5914525f5a4fb208601d9e9986",
+        "170303002e872ee3554d4d1ecb7fbf5ea0332d29e54879dc252e0c5b871e6a850ba295f37b8d9ee1800e0118842c03b4f74bf9"
+      ],
+      "c2s_post_rekey": [
+        "170303002ecae21faa64227dbe89ca4e392c4a6c44afe7551dca212eef62505e2b5cf1c14a0ed97b03a8e46fcef416264ea874"
+      ],
+      "client_secret": "1534537291b0cfee0d2c4b6a89a8c7e60524436281a0bfdefd1c3b5a7998b7d6f51433527190afceed0c2b4a6988a7c6e504234261809fbeddfc1b3a597897b6",
+      "rekey_client_secret": "37567594b3d2f1102f4e6d8cabcae90827466584a3c2e1001f3e5d7c9bbad9f81736557493b2d1f00f2e4d6c8baac9e80726456483a2c1e0ff1e3d5c7b9ab9d8",
+      "rekey_server_secret": "405f7e9dbcdbfa1938577695b4d3f211304f6e8daccbea0928476685a4c3e201203f5e7d9cbbdaf91837567594b3d2f1102f4e6d8cabcae90827466584a3c2e1",
+      "s2c": [
+        "170303001d3b885dca1e72c80fe8e43c2459294d0d06df9f2c700bb296339a076376"
+      ],
+      "s2c_post_rekey": [
+        "170303002e1fe50e668e8feaa62fe91cf96a3e3d874054f46c315af738c2888341afb55812ccc96235476f3d5778cce4d0761e"
+      ],
+      "server_secret": "26456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8c7",
+      "suite": 4
+    },
+    {
+      "c2s": [
+        "170303001dffb1f4482f50e83b297dd08e10942a804930ff9c45d15ad8da36a0a8dc",
+        "170303002e3d04e379982db1fd625089b9c3435b5f27117d074cb42a61f539586de2208a7a3e32502c7fbf1e31b81d150ca286"
+      ],
+      "c2s_post_rekey": [
+        "170303002ea470fa51aeb0f48a2b2f03fa237d24e0957935c52253ebecaf8a5fe2893f4574366622d69eeced2cfb8a67d9a202"
+      ],
+      "client_secret": "1433527190afceed0c2b4a6988a7c6e504234261809fbeddfc1b3a597897b6d5f4133251708faecdec0b2a496887a6c5e4032241607f9ebddcfb1a39587796b5",
+      "rekey_client_secret": "36557493b2d1f00f2e4d6c8baac9e80726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7",
+      "rekey_server_secret": "41607f9ebddcfb1a39587796b5d4f31231506f8eadcceb0a29486786a5c4e30221405f7e9dbcdbfa1938577695b4d3f211304f6e8daccbea0928476685a4c3e2",
+      "s2c": [
+        "170303001d20ae043b4776ae481a76cde700de48718fe6d033c8bf7672f975a0e89f"
+      ],
+      "s2c_post_rekey": [
+        "170303002ed410c9da77f0be95997cda203c5bb4eac2fa251ab3aeb26f5a363c55787e3a2c0e1c669b4bf3e35ffa7be8eb251d"
+      ],
+      "server_secret": "27466584a3c2e1001f3e5d7c9bbad9f81736557493b2d1f00f2e4d6c8baac9e80726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8",
+      "suite": 5
+    },
+    {
+      "c2s": [
+        "170303001d8574d6ea9b0f5e9bffd61c78964ac4b54c8693ca8cf68c7f7ca86c7c9b",
+        "170303002e62e99f087b4cb34a39ad70c01f93bb5bc49051cc4985d35dfcb1b4e5d40c0e6962825606bf518d7941e2deba08ad"
+      ],
+      "c2s_post_rekey": [
+        "170303002e4679a38c09178273bb52226b3a9e41d9945f6623eef2a7b284f2b0b869de6adb78b7003b99d80ca6e3050e11d044"
+      ],
+      "client_secret": "1736557493b2d1f00f2e4d6c8baac9e80726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8",
+      "rekey_client_secret": "35547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8c7e60524436281a0bfdefd1c3b5a7998b7d6",
+      "rekey_server_secret": "4261809fbeddfc1b3a597897b6d5f4133251708faecdec0b2a496887a6c5e4032241607f9ebddcfb1a39587796b5d4f31231506f8eadcceb0a29486786a5c4e3",
+      "s2c": [
+        "170303001d22df29298580ff9103cda5b75fde1a1b3b8fd05f0e8af5e227a45b5b52"
+      ],
+      "s2c_post_rekey": [
+        "170303002e4bc549a2839a899e5384e9278900f4835a81fa1d9910274f6671a621ccb1f33b42eb6d3b50c2f48a4a1ed601e790"
+      ],
+      "server_secret": "24436281a0bfdefd1c3b5a7998b7d6f51433527190afceed0c2b4a6988a7c6e504234261809fbeddfc1b3a597897b6d5f4133251708faecdec0b2a496887a6c5",
+      "suite": 6
+    },
+    {
+      "c2s": [
+        "170303001db2166f70dbcc6b606ea857ec4a1709aaec603a6b53d652fa9b3a574824",
+        "170303002ec09bb84cbb7cd856945dc9a63ab1060ab7cc2287d265b1b42dcb2a0a5a7028f2d6df7be5e5f2c3a713431a961cb6"
+      ],
+      "c2s_post_rekey": [
+        "170303002e5a648d5dfe079cb24a1aa628f8f5a485c88ed6f954d8bec0f0d5769a1a02b1bb5f01056c0c9dbdbd7fcbbe30636e"
+      ],
+      "client_secret": "1635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8c7",
+      "rekey_client_secret": "34537291b0cfee0d2c4b6a89a8c7e60524436281a0bfdefd1c3b5a7998b7d6f51433527190afceed0c2b4a6988a7c6e5",
+      "rekey_server_secret": "436281a0bfdefd1c3b5a7998b7d6f51433527190afceed0c2b4a6988a7c6e504234261809fbeddfc1b3a597897b6d5f4",
+      "s2c": [
+        "170303001dd86d232e3b1215229403a862c96736992bd5b9cc9a467c468a850b1503"
+      ],
+      "s2c_post_rekey": [
+        "170303002ecdbd6dd5d0f85611fa778dfbdc70ec34a2e3284c56f596723681821ab31d800ed80f67440b3eb1949dab3d990cdd"
+      ],
+      "server_secret": "25446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d2c4b6a89a8c7e60524436281a0bfdefd1c3b5a7998b7d6",
+      "suite": 7
+    },
+    {
+      "c2s": [
+        "170303001d7100d62d2d7fade559afd1078a787110cc8bfefe31019d8ec155e270c9",
+        "170303002e4e85fccc3f1543cea7b94415f9bdaae8809d693b757a4e82f82b9821657a9b166803d056693ae8bfddb2b5349a36"
+      ],
+      "c2s_post_rekey": [
+        "170303002ec0bdef62ccfdeee9d2537c80b230ad5ea7d9177825cd83dc478642f18358e0d0e5f417858dc33a92636d02ef60d0"
+      ],
+      "client_secret": "5f7e9dbcdbfa1938577695b4d3f211304f6e8daccbea0928476685a4c3e201203f5e7d9cbbdaf91837567594b3d2f1102f4e6d8cabcae90827466584a3c2e100",
+      "rekey_client_secret": "7d9cbbdaf91837567594b3d2f1102f4e6d8cabcae90827466584a3c2e1001f3e5d7c9bbad9f81736557493b2d1f00f2e4d6c8baac9e80726456483a2c1e0ff1e",
+      "rekey_server_secret": "0a29486786a5c4e30221405f7e9dbcdbfa1938577695b4d3f211304f6e8daccbea0928476685a4c3e201203f5e7d9cbbdaf91837567594b3d2f1102f4e6d8cab",
+      "s2c": [
+        "170303001dacca96b147641cfcac3cdf7d7be926eadb20b597fedd8f80a4590baf94"
+      ],
+      "s2c_post_rekey": [
+        "170303002e9e1e464c95641876ff0f170a32474e10d47759ed549d484c3392c3947101dba62b0b8593371a0aa12ad4f80dfe51"
+      ],
+      "server_secret": "6c8baac9e80726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0ef0e2d4c6b8aa9c8e70625446382a1c0dffe1d3c5b7a99b8d7f61534537291b0cfee0d",
+      "suite": 78
+    }
+  ]
+}

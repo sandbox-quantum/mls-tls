@@ -1,6 +1,35 @@
 //! `mls-tls` — a public API over the 2PMLS + MLS-TLS IETF drafts.
 //!
 //! An MLS group (via `mls-rs`) is used as the key-agreement engine feeding a TLS 1.3 record layer.
+//!
+//! # Crypto backends
+//!
+//! Exactly one backend is selected at compile time, and it serves *everything* — the MLS group, the
+//! record layer, and X.509 chain verification. There is no second crypto path.
+//!
+//! | Feature | Primitives | Suites | X.509 |
+//! |---|---|---|---|
+//! | `rustcrypto` (default) | pure Rust | all seven MLS suites + X-Wing (`0x004e`) | `rustls-webpki` / `ring` |
+//! | `openssl` | system OpenSSL | the seven standard MLS suites | OpenSSL `X509_STORE` |
+//! | `fips` | OpenSSL FIPS provider | `P256_AES128`, `P384_AES256`, `P521_AES256` | OpenSSL `X509_STORE` |
+//!
+//! ```text
+//! cargo build                                          # rustcrypto
+//! cargo build --no-default-features --features openssl
+//! cargo build --no-default-features --features fips
+//! ```
+//!
+//! `--no-default-features` is required for the non-default backends: cargo features are additive,
+//! so `--features openssl` alone would also leave `rustcrypto` on and trip the mutual-exclusion
+//! check below.
+//!
+//! # FIPS mode
+//!
+//! The `fips` feature restricts the crate to FIPS-approved operation. Call [`fips::enable`] as the
+//! first statement in `main()`; every connection constructor refuses to run until it has. Four MLS
+//! suites are unavailable — the X25519/X448 ones because those curves are not approved for key
+//! agreement, and the ChaCha20-Poly1305 ones because the FIPS provider has no such cipher. See the
+//! [`fips`] module for what is and is not being claimed.
 
 // Exactly one crypto backend must be selected at compile time; the two are mutually exclusive.
 #[cfg(all(feature = "rustcrypto", feature = "openssl"))]
@@ -10,13 +39,21 @@ compile_error!(
 );
 #[cfg(not(any(feature = "rustcrypto", feature = "openssl")))]
 compile_error!("enable exactly one crypto backend feature: `rustcrypto` (default) or `openssl`");
+// `fips` implies `openssl` in Cargo.toml, so this only fires if that wiring is broken.
+#[cfg(all(feature = "fips", not(feature = "openssl")))]
+compile_error!(
+    "feature `fips` requires `openssl` — build with `--no-default-features --features fips`"
+);
 
 pub(crate) mod crypto;
 pub(crate) mod mls_tls_01;
 pub(crate) mod mls_two_party_profile_00;
+pub(crate) mod pki;
 pub(crate) mod tls_record;
 pub(crate) mod tree_printer;
-pub(crate) mod web_pki;
+
+#[cfg(feature = "fips")]
+pub mod fips;
 
 mod builder;
 pub mod client;
@@ -43,7 +80,7 @@ pub use mls_rs::CipherSuite;
 pub use mls_rs::crypto::{SignaturePublicKey, SignatureSecretKey};
 pub use mls_rs::identity::SigningIdentity;
 pub use mls_rs::identity::x509::CertificateChain;
-pub use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor};
+pub use rustls_pki_types::{CertificateDer, ServerName};
 pub use tls_record::Role as Side;
 
 // --- internal imports for the crate-root handshake helpers ---
@@ -58,7 +95,7 @@ use mls_rs::{
 
 use crate::{
     crypto::provider::MlsTlsCryptoProvider, mls_two_party_profile_00::TwoPartyMlsRules,
-    web_pki::PassThroughIdentityProvider,
+    pki::PassThroughIdentityProvider,
 };
 
 /// Build an MLS client with the accept-all identity provider and the two-party rules.
@@ -95,20 +132,45 @@ pub(crate) fn create_record_layer(
     let crypto = MlsTlsCryptoProvider::new();
     let client_ts =
         mls_tls_01::derive_client_application_traffic_secret(mls_group, crypto.clone())?;
-    let server_ts = mls_tls_01::derive_server_application_traffic_secret(mls_group, crypto)?;
+    let server_ts =
+        mls_tls_01::derive_server_application_traffic_secret(mls_group, crypto.clone())?;
 
-    let params = tls_record::SuiteParams::for_cipher_suite(mls_group.cipher_suite().into())?;
+    // The record layer protects traffic with the group's own suite provider, so an unsupported
+    // suite is rejected here rather than silently mapped to different record protection.
+    let cipher_suite = mls_group.cipher_suite();
+    let csp = crypto.cipher_suite_provider(cipher_suite).ok_or(
+        tls_record::RecordError::UnsupportedCipherSuite(cipher_suite.into()),
+    )?;
+
     // Only ever called to build a *fresh* codec — at the initial handshake and at resumption (both
     // over a new transport) — so it always uses the epoch-1 `<c|s> ap traffic` context (the 64-zero
     // handshake-hash placeholder). Per-epoch rekeys on a live transport go through
     // `RecordLayer::apply_rekey`, which uses the empty context.
     Ok(tls_record::RecordLayer::from_traffic_secrets(
-        params,
+        csp,
         client_ts.as_bytes(),
         server_ts.as_bytes(),
         role,
         true,
-    ))
+    )?)
+}
+
+/// Test-only crypto bootstrap.
+///
+/// A `fips` build loads **no** OpenSSL providers until [`fips::enable`] runs — the config file
+/// deliberately activates nothing, so the automatic default-provider fallback is suppressed and
+/// every algorithm fetch fails. Any test that touches cryptography must therefore call this first.
+/// It is a no-op on the other backends.
+///
+/// Failing loudly rather than skipping is deliberate: a silently-skipped FIPS suite is worse than
+/// no suite at all.
+#[cfg(test)]
+pub(crate) fn test_init() {
+    #[cfg(feature = "fips")]
+    fips::enable().expect(
+        "the `fips` test suite needs an OpenSSL FIPS module; run it in the container \
+         (see docker/fips/README.md)",
+    );
 }
 
 #[cfg(test)]
@@ -118,6 +180,8 @@ mod tests {
     use crate::server::{ServerConfig, ServerConnection};
     use rustls_pki_types::ServerName;
     use std::io::{Read, Write};
+
+    use crate::test_init as init;
 
     /// Move all of `from`'s buffered TLS bytes into `to`, then process them. Returns bytes moved.
     fn pump(from: &mut ConnectionCommon, to: &mut ConnectionCommon) -> usize {
@@ -152,6 +216,7 @@ mod tests {
     }
 
     fn established_pair() -> (ClientConnection, ServerConnection) {
+        init();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_generated_basic_credential(b"server")
@@ -210,6 +275,7 @@ mod tests {
 
     #[test]
     fn loopback_resumption() {
+        init();
         use crate::client::ClientConfig;
         use crate::server::ServerConfig;
 
@@ -267,6 +333,7 @@ mod tests {
 
     #[test]
     fn resumption_rejects_changed_server_identity() {
+        init();
         use crate::client::{ClientConfig, generate_signature_key};
         use crate::server::{ServerConfig, ServerConnection};
         use mls_rs::identity::{SigningIdentity, basic::BasicCredential};

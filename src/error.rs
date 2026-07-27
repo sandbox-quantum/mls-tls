@@ -1,13 +1,13 @@
 //! Unified error type for the public API.
 //!
 //! Every fallible public method returns [`Error`]. It folds in the crate's internal error types
-//! (`TwoPartyError`, `RecordError`, `MlsTlsError`, `WebPkiIdentityError`) plus the sans-I/O
+//! (`TwoPartyError`, `RecordError`, `MlsTlsError`, `PkiError`) plus the sans-I/O
 //! framing/state errors surfaced by the connection.
 
 use crate::mls_tls_01::MlsTlsError;
 use crate::mls_two_party_profile_00::TwoPartyError;
+use crate::pki::PkiError;
 use crate::tls_record::RecordError;
-use crate::web_pki::WebPkiIdentityError;
 
 /// The single error type returned by the `mls-tls` public API.
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +35,7 @@ pub enum Error {
 
     /// The peer's credential was rejected during the directional peer check.
     #[error("peer identity rejected")]
-    Identity(#[from] WebPkiIdentityError),
+    Identity(#[from] PkiError),
 
     /// Peer authentication failed (e.g. the joined group's key did not match the presented one).
     #[error("peer authentication failed: {0}")]
@@ -52,6 +52,12 @@ pub enum Error {
     /// A feature that is defined in the design but not yet implemented.
     #[error("feature not yet supported: {0}")]
     Unsupported(&'static str),
+
+    /// FIPS mode could not be activated, or is required by this build but is not active.
+    /// See [`crate::fips`].
+    #[cfg(feature = "fips")]
+    #[error("FIPS mode: {0}")]
+    Fips(String),
 
     /// The peer signalled (or the transport indicated) that the connection is closed.
     #[error("peer closed the connection")]

@@ -73,14 +73,14 @@ fn expand_seed(ikm: &[u8]) -> ([u8; 32], [u8; 32], [u8; 48]) {
     (d, z, s)
 }
 
-/// Interpret 48 big-endian bytes as a P-384 scalar WITHOUT reduction 
+/// Interpret 48 big-endian bytes as a P-384 scalar WITHOUT reduction
 /// `ec.derive_private_key`, which rejects scalars ≥ n). Errors on the negligible ≥n case.
 fn p384_scalar_no_reduce(bytes: &[u8; 48]) -> Result<Scalar, XWingError> {
     let fb = FieldBytes::clone_from_slice(bytes);
     Option::<Scalar>::from(Scalar::from_repr(fb)).ok_or(XWingError::P384)
 }
 
-/// Reduce 48 big-endian bytes mod n into a P-384 scalar 
+/// Reduce 48 big-endian bytes mod n into a P-384 scalar
 fn p384_scalar_reduce(bytes: &[u8; 48]) -> Scalar {
     Scalar::reduce(U384::from_be_slice(bytes))
 }

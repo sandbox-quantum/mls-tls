@@ -2,7 +2,7 @@
 //!
 //! The `verifier` is a credential-verification *policy* — how the client checks the *server's*
 //! credential during the handshake. It is consumed by the manual, directional check in
-//! `web_pki::validate_server_credential` (see the connection code), **not** installed as the mls-rs
+//! `pki::validate_server_credential` (see the connection code), **not** installed as the mls-rs
 //! identity provider (which is always accept-all; see [`crate::mls_config`]).
 
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use mls_rs::{
     identity::{SigningIdentity, basic::BasicCredential},
     storage_provider::in_memory::InMemoryGroupStateStorage,
 };
-use rustls_pki_types::TrustAnchor;
+use rustls_pki_types::CertificateDer;
 
 use std::ops::{Deref, DerefMut};
 
@@ -44,11 +44,14 @@ pub(crate) const CIPHER_SUITE: CipherSuite = CipherSuite::P384_AES256;
 /// accept-all).
 #[derive(Clone)]
 pub enum ServerCertVerifier {
-    /// Validate the server's X.509 chain against these trust anchors (and, at connect time, the
-    /// requested `ServerName`).
-    WebPki {
-        trust_anchors: Vec<TrustAnchor<'static>>,
-    },
+    /// Validate the server's X.509 chain against these root certificates (and, at connect time,
+    /// the requested `ServerName`).
+    Roots(Vec<CertificateDer<'static>>),
+    /// Validate against the compiled backend's built-in root set.
+    ///
+    /// **The trust base differs by backend**: the bundled Mozilla set under `rustcrypto`, OpenSSL's
+    /// configured trust store under `openssl`. Use [`Self::Roots`] when that distinction matters.
+    DefaultRoots,
     /// Accept any server credential (e.g. a Basic credential). No PKI verification.
     None,
 }
@@ -82,21 +85,29 @@ impl ClientConfig {
 }
 
 impl ConfigBuilder<ClientConfig, WantsVerifier> {
-    /// Verify the server's X.509 certificate against the given trust anchors.
+    /// Verify the server's X.509 certificate against the given root certificates (DER).
     pub fn with_root_certificates(
         self,
-        trust_anchors: Vec<TrustAnchor<'static>>,
+        roots: Vec<CertificateDer<'static>>,
     ) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
-        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::WebPki {
-            trust_anchors,
-        }))
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::Roots(roots)))
     }
 
-    /// Verify the server against the Mozilla webpki root set.
+    /// Verify the server against the bundled Mozilla root set.
+    ///
+    /// `rustcrypto` only: the set ships as webpki `TrustAnchor`s, which OpenSSL's `X509_STORE`
+    /// cannot consume. Under `openssl`/`fips` use [`Self::with_system_roots`] or supply DER roots
+    /// via [`Self::with_root_certificates`].
+    #[cfg(feature = "rustcrypto")]
     pub fn with_webpki_roots(self) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
-        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::WebPki {
-            trust_anchors: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        }))
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::DefaultRoots))
+    }
+
+    /// Verify the server against OpenSSL's configured default trust store (`SSL_CERT_DIR` /
+    /// `SSL_CERT_FILE` / the compiled-in `OPENSSLDIR`).
+    #[cfg(feature = "openssl")]
+    pub fn with_system_roots(self) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
+        ConfigBuilder::new(WantsClientCredential::new(ServerCertVerifier::DefaultRoots))
     }
 
     /// Do not verify the server's certificate. Accepts any credential — use only when peer
@@ -175,6 +186,12 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
 pub(crate) fn generate_signature_key(
     cipher_suite: CipherSuite,
 ) -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
+    // The earliest point at which a caller touches cryptography — before any connection exists.
+    // Without this the failure would surface as an opaque "unsupported algorithm" fetch error from
+    // deep inside OpenSSL, because a FIPS build has *no* providers loaded until `enable()` runs.
+    #[cfg(feature = "fips")]
+    crate::fips::assert_enabled()?;
+
     let csp = MlsTlsCryptoProvider::new()
         .cipher_suite_provider(cipher_suite)
         .ok_or(Error::Unsupported("cipher suite unavailable"))?;
@@ -191,6 +208,9 @@ impl ClientConnection {
     /// Start a client connection to `server_name`, queuing the ClientHello. Drive the handshake by
     /// pumping `write_tls` / `read_tls` + `process_new_packets` until `is_handshaking()` is false.
     pub fn new(config: Arc<ClientConfig>, server_name: ServerName<'static>) -> Result<Self, Error> {
+        #[cfg(feature = "fips")]
+        crate::fips::assert_enabled()?;
+
         let client = build_mls_client(
             config.signing_identity.clone(),
             config.signer.clone(),
@@ -217,6 +237,9 @@ impl ClientConnection {
         server_name: ServerName<'static>,
         state: ResumptionState,
     ) -> Result<Self, Error> {
+        #[cfg(feature = "fips")]
+        crate::fips::assert_enabled()?;
+
         // Reload the persisted group, create + merge a self-update commit (advancing to the new
         // epoch), and build the fresh record layer. The connection then sends a Resumption and awaits
         // the server's ConnectionConfirmation. The fresh server pre-handshake key is checked against
@@ -261,14 +284,29 @@ impl DerefMut for ClientConnection {
 mod tests {
     use super::*;
 
+    /// The backend's built-in root set, under whichever name that backend spells it.
+    fn with_default_roots() -> ConfigBuilder<ClientConfig, WantsClientCredential> {
+        #[cfg(feature = "rustcrypto")]
+        return ClientConfig::builder().with_webpki_roots();
+        #[cfg(feature = "openssl")]
+        return ClientConfig::builder().with_system_roots();
+    }
+
     #[test]
     fn builds_secure_and_insecure_client_configs() {
-        // secure (webpki roots) + generated credential
-        let secure = ClientConfig::builder()
-            .with_webpki_roots()
+        crate::test_init();
+        // default roots + generated credential
+        let secure = with_default_roots()
             .with_generated_basic_credential(b"alice")
             .unwrap();
-        assert!(matches!(secure.verifier, ServerCertVerifier::WebPki { .. }));
+        assert!(matches!(secure.verifier, ServerCertVerifier::DefaultRoots));
+
+        // explicit DER roots
+        let explicit = ClientConfig::builder()
+            .with_root_certificates(vec![CertificateDer::from(vec![0x30, 0x00])])
+            .with_generated_basic_credential(b"carol")
+            .unwrap();
+        assert!(matches!(explicit.verifier, ServerCertVerifier::Roots(ref r) if r.len() == 1));
 
         // no verification + generated credential
         let insecure = ClientConfig::builder()
