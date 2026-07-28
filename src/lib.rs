@@ -11,25 +11,15 @@
 //! |---|---|---|---|
 //! | `rustcrypto` (default) | pure Rust | all seven MLS suites + X-Wing (`0x004e`) | `rustls-webpki` / `ring` |
 //! | `openssl` | system OpenSSL | the seven standard MLS suites | OpenSSL `X509_STORE` |
-//! | `fips` | OpenSSL FIPS provider | `P256_AES128`, `P384_AES256`, `P521_AES256` | OpenSSL `X509_STORE` |
 //!
 //! ```text
 //! cargo build                                          # rustcrypto
 //! cargo build --no-default-features --features openssl
-//! cargo build --no-default-features --features fips
 //! ```
 //!
-//! `--no-default-features` is required for the non-default backends: cargo features are additive,
+//! `--no-default-features` is required for the non-default backend: cargo features are additive,
 //! so `--features openssl` alone would also leave `rustcrypto` on and trip the mutual-exclusion
 //! check below.
-//!
-//! # FIPS mode
-//!
-//! The `fips` feature restricts the crate to FIPS-approved operation. Call [`fips::enable`] as the
-//! first statement in `main()`; every connection constructor refuses to run until it has. Four MLS
-//! suites are unavailable — the X25519/X448 ones because those curves are not approved for key
-//! agreement, and the ChaCha20-Poly1305 ones because the FIPS provider has no such cipher. See the
-//! [`fips`] module for what is and is not being claimed.
 
 // Exactly one crypto backend must be selected at compile time; the two are mutually exclusive.
 #[cfg(all(feature = "rustcrypto", feature = "openssl"))]
@@ -39,11 +29,6 @@ compile_error!(
 );
 #[cfg(not(any(feature = "rustcrypto", feature = "openssl")))]
 compile_error!("enable exactly one crypto backend feature: `rustcrypto` (default) or `openssl`");
-// `fips` implies `openssl` in Cargo.toml, so this only fires if that wiring is broken.
-#[cfg(all(feature = "fips", not(feature = "openssl")))]
-compile_error!(
-    "feature `fips` requires `openssl` — build with `--no-default-features --features fips`"
-);
 
 pub(crate) mod crypto;
 pub(crate) mod mls_tls_01;
@@ -51,9 +36,6 @@ pub(crate) mod mls_two_party_profile_00;
 pub(crate) mod pki;
 pub(crate) mod tls_record;
 pub(crate) mod tree_printer;
-
-#[cfg(feature = "fips")]
-pub mod fips;
 
 mod builder;
 pub mod client;
@@ -159,24 +141,6 @@ pub(crate) fn create_record_layer(
     )?)
 }
 
-/// Test-only crypto bootstrap.
-///
-/// A `fips` build loads **no** OpenSSL providers until [`fips::enable`] runs — the config file
-/// deliberately activates nothing, so the automatic default-provider fallback is suppressed and
-/// every algorithm fetch fails. Any test that touches cryptography must therefore call this first.
-/// It is a no-op on the other backends.
-///
-/// Failing loudly rather than skipping is deliberate: a silently-skipped FIPS suite is worse than
-/// no suite at all.
-#[cfg(test)]
-pub(crate) fn test_init() {
-    #[cfg(feature = "fips")]
-    fips::enable().expect(
-        "the `fips` test suite needs an OpenSSL FIPS module; run it in the container \
-         (see docker/fips/README.md)",
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use crate::client::{ClientConfig, ClientConnection};
@@ -184,8 +148,6 @@ mod tests {
     use crate::server::{ServerConfig, ServerConnection};
     use rustls_pki_types::ServerName;
     use std::io::{Read, Write};
-
-    use crate::test_init as init;
 
     /// Move all of `from`'s buffered TLS bytes into `to`, then process them. Returns bytes moved.
     fn pump(from: &mut ConnectionCommon, to: &mut ConnectionCommon) -> usize {
@@ -220,7 +182,6 @@ mod tests {
     }
 
     fn established_pair() -> (ClientConnection, ServerConnection) {
-        init();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_generated_basic_credential(b"server")
@@ -311,7 +272,6 @@ mod tests {
 
     #[test]
     fn loopback_resumption() {
-        init();
         use crate::client::ClientConfig;
         use crate::server::ServerConfig;
 
@@ -381,7 +341,6 @@ mod tests {
     /// `is_handshaking()` before writing.
     #[test]
     fn loopback_resumption_early_data() {
-        init();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_generated_basic_credential(b"server")
@@ -424,7 +383,6 @@ mod tests {
     /// reload it, so no keys are installed and the connection never establishes.
     #[test]
     fn resumption_rejects_unknown_group() {
-        init();
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_generated_basic_credential(b"server")

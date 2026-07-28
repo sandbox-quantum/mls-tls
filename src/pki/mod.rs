@@ -14,9 +14,7 @@
 //! being fixed:
 //!
 //! - `rustcrypto` → [`webpki_backend`], i.e. `rustls-webpki` over `ring`.
-//! - `openssl` (and therefore `fips`) → [`openssl_backend`], i.e. an OpenSSL `X509_STORE`. Under
-//!   `fips` this keeps certificate signature verification inside the validated module, which the
-//!   webpki path could not do.
+//! - `openssl` → [`openssl_backend`], i.e. an OpenSSL `X509_STORE`.
 //!
 //! Both expose the same `validate_chain`, so the callers above are backend-agnostic.
 

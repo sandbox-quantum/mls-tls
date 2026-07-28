@@ -84,7 +84,6 @@ mod tests {
 
     /// Build a Basic-credential signing identity for the given suite (compiled backend).
     fn basic_identity(id: &[u8], cs: CipherSuite) -> (SigningIdentity, SignatureSecretKey) {
-        crate::test_init();
         let csp = MlsTlsCryptoProvider::new()
             .cipher_suite_provider(cs)
             .expect("suite supported");
@@ -160,7 +159,6 @@ mod tests {
     #[cfg(feature = "openssl")]
     #[test]
     fn xwing_unsupported_under_openssl() {
-        crate::test_init();
         let provider = MlsTlsCryptoProvider::new();
         assert!(
             provider

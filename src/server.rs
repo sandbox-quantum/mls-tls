@@ -162,9 +162,6 @@ impl ServerConnection {
     /// handshake by pumping `read_tls` + `process_new_packets` / `write_tls` until `is_handshaking()`
     /// is false.
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
-        #[cfg(feature = "fips")]
-        crate::fips::assert_enabled()?;
-
         let server_ctx = ServerCtx {
             signing_identity: config.signing_identity.clone(),
             signer: config.signer.clone(),

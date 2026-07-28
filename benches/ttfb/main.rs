@@ -480,9 +480,7 @@ fn report_json(rows: &[Row], args: &Args) {
 }
 
 fn backend_name() -> &'static str {
-    #[cfg(feature = "fips")]
-    return "fips";
-    #[cfg(all(feature = "openssl", not(feature = "fips")))]
+    #[cfg(feature = "openssl")]
     return "openssl";
     #[cfg(feature = "rustcrypto")]
     return "rustcrypto";
@@ -669,9 +667,8 @@ fn run(args: &Args) -> Result<(), BenchError> {
              mean nothing. Measure with `cargo bench --bench ttfb`."
         );
     }
-    // Check every suite up front. X-Wing exists only under `rustcrypto`, and the ChaCha and
-    // X25519/X448 suites are refused under `fips`, so a mismatched `--suites`/`--features` pair
-    // would otherwise die opaquely partway through a sweep.
+    // Check every suite up front. X-Wing exists only under `rustcrypto`, so a mismatched
+    // `--suites`/`--features` pair would otherwise die opaquely partway through a sweep.
     for cipher_suite in &args.suites {
         configs(*cipher_suite)
             .map_err(|_| BenchError::UnsupportedSuite(suite_label(*cipher_suite)))?;
@@ -735,10 +732,6 @@ fn run(args: &Args) -> Result<(), BenchError> {
 }
 
 fn main() {
-    // A `fips` build loads no OpenSSL providers until this runs, so it has to come first.
-    #[cfg(feature = "fips")]
-    mls_tls::fips::enable().expect("FIPS mode could not be activated");
-
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let args = match Args::parse(&argv) {
         Ok(Some(args)) => args,

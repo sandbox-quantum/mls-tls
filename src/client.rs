@@ -96,7 +96,7 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
     /// Verify the server against the bundled Mozilla root set.
     ///
     /// `rustcrypto` only: the set ships as webpki `TrustAnchor`s, which OpenSSL's `X509_STORE`
-    /// cannot consume. Under `openssl`/`fips` use [`Self::with_system_roots`] or supply DER roots
+    /// cannot consume. Under `openssl` use [`Self::with_system_roots`] or supply DER roots
     /// via [`Self::with_root_certificates`].
     #[cfg(feature = "rustcrypto")]
     pub fn with_webpki_roots(self) -> ConfigBuilder<ClientConfig, WantsClientCredential> {
@@ -204,12 +204,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCredential> {
 pub fn generate_signature_key(
     cipher_suite: CipherSuite,
 ) -> Result<(SignatureSecretKey, SignaturePublicKey), Error> {
-    // The earliest point at which a caller touches cryptography — before any connection exists.
-    // Without this the failure would surface as an opaque "unsupported algorithm" fetch error from
-    // deep inside OpenSSL, because a FIPS build has *no* providers loaded until `enable()` runs.
-    #[cfg(feature = "fips")]
-    crate::fips::assert_enabled()?;
-
     let csp = MlsTlsCryptoProvider::new()
         .cipher_suite_provider(cipher_suite)
         .ok_or(Error::Unsupported("cipher suite unavailable"))?;
@@ -226,9 +220,6 @@ impl ClientConnection {
     /// Start a client connection to `server_name`, queuing the ClientHello. Drive the handshake by
     /// pumping `write_tls` / `read_tls` + `process_new_packets` until `is_handshaking()` is false.
     pub fn new(config: Arc<ClientConfig>, server_name: ServerName<'static>) -> Result<Self, Error> {
-        #[cfg(feature = "fips")]
-        crate::fips::assert_enabled()?;
-
         let client = build_mls_client(
             config.signing_identity.clone(),
             config.signer.clone(),
@@ -255,9 +246,6 @@ impl ClientConnection {
         server_name: ServerName<'static>,
         state: ResumptionState,
     ) -> Result<Self, Error> {
-        #[cfg(feature = "fips")]
-        crate::fips::assert_enabled()?;
-
         // Reload the persisted group, create + merge a self-update commit (advancing to the new
         // epoch), and build the fresh record layer. The connection then sends a Resumption and awaits
         // the server's ConnectionConfirmation. The responder credential persisted in the group is
@@ -312,7 +300,6 @@ mod tests {
 
     #[test]
     fn builds_secure_and_insecure_client_configs() {
-        crate::test_init();
         // default roots + generated credential
         let secure = with_default_roots()
             .with_generated_basic_credential(b"alice")

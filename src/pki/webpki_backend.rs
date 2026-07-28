@@ -1,5 +1,5 @@
 //! X.509 chain verification via `rustls-webpki` (backed by `ring`). Used under the `rustcrypto`
-//! backend only — `ring` is outside any FIPS boundary, so the `openssl` builds use
+//! backend only — an `openssl` build would otherwise pull in a second crypto stack, so it uses
 //! [`super::openssl_backend`] instead.
 
 use mls_rs::identity::x509::CertificateChain;

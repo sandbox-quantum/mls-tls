@@ -49,12 +49,6 @@ pub enum Error {
     #[error("feature not yet supported: {0}")]
     Unsupported(&'static str),
 
-    /// FIPS mode could not be activated, or is required by this build but is not active.
-    /// See [`crate::fips`].
-    #[cfg(feature = "fips")]
-    #[error("FIPS mode: {0}")]
-    Fips(String),
-
     /// The peer signalled (or the transport indicated) that the connection is closed.
     #[error("peer closed the connection")]
     PeerClosed,

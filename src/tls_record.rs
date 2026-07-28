@@ -340,8 +340,8 @@ impl RecordLayer {
 }
 
 /// Every MLS suite plus X-Wing. Which of these the compiled backend actually serves varies —
-/// X-Wing is `rustcrypto`-only, and a `fips` build drops the X25519/X448/ChaCha suites — so tests
-/// iterate this list and skip what [`suite_provider`] declines.
+/// X-Wing is `rustcrypto`-only — so tests iterate this list and skip what [`suite_provider`]
+/// declines.
 #[cfg(test)]
 const ALL_SUITES: &[u16] = &[
     0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x004e,
@@ -351,7 +351,6 @@ const ALL_SUITES: &[u16] = &[
 #[cfg(test)]
 fn suite_provider(suite: u16) -> Option<MlsTlsCipherSuiteProvider> {
     use mls_rs::{CipherSuite, CryptoProvider};
-    crate::test_init();
     crate::crypto::provider::MlsTlsCryptoProvider::new()
         .cipher_suite_provider(CipherSuite::new(suite))
 }
@@ -601,7 +600,7 @@ mod kat {
 mod tests {
     use super::*;
 
-    /// `P384_AES256` — the one standard suite every backend serves, including `fips`.
+    /// `P384_AES256` — the one standard suite every backend serves.
     const UNIVERSAL_SUITE: u16 = 0x0007;
 
     /// Build a client/server pair for `suite` over the given secrets.
@@ -718,33 +717,4 @@ mod tests {
         assert_eq!(make_nonce(&iv, 1), expected);
     }
 
-    /// HKDF-Expand output is prefix-stable: `T(i)` does not depend on the requested length, so
-    /// asking for `Nh` bytes and truncating yields exactly the shorter derivation.
-    ///
-    /// This is what licenses the "derive full length then truncate" workaround for FIPS modules
-    /// that reject sub-digest `EXPAND_ONLY` outputs, and it is checked here so the property is
-    /// pinned even on backends that do not need the workaround.
-    #[test]
-    fn kdf_expand_is_prefix_stable() {
-        for &suite in ALL_SUITES {
-            let Some(csp) = suite_provider(suite) else {
-                continue;
-            };
-            let nh = csp.kdf_extract_size();
-            let prk = vec![0x5au8; nh];
-            let full = csp.kdf_expand(&prk, b"prefix-stability", nh).unwrap();
-            // 12 = record IV, 16/32 = AEAD keys — every short length this stack actually asks for.
-            for len in [12usize, 16, 32] {
-                if len > nh {
-                    continue;
-                }
-                let short = csp.kdf_expand(&prk, b"prefix-stability", len).unwrap();
-                assert_eq!(
-                    &short[..],
-                    &full[..len],
-                    "suite {suite:#06x}: expand({len}) is not a prefix of expand({nh})"
-                );
-            }
-        }
-    }
 }

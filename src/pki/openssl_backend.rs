@@ -1,9 +1,7 @@
 //! X.509 chain verification via an OpenSSL `X509_STORE`.
 //!
-//! Used under the `openssl` backend, and required under `fips`: certificate signature verification
-//! is a cryptographic service, so it has to happen inside the validated module rather than in
-//! `ring`. Everything here goes through the default library context, which is where
-//! [`crate::fips::enable`] installs the FIPS provider and the `fips=yes` default property.
+//! Used under the `openssl` backend: certificate signature verification is a cryptographic service,
+//! so it is served by the same library the rest of the build uses rather than by `ring`.
 //!
 //! Name checking is done by the store's `X509_VERIFY_PARAM` (`set_host` / `set_ip`), which OpenSSL
 //! applies during `X509_verify_cert` — deliberately *not* a separate post-hoc check, so a chain can
@@ -141,10 +139,9 @@ mod tests {
         bn.to_asn1_integer().unwrap()
     }
 
-    /// A self-signed P-256 CA. Built with OpenSSL so the `fips` test path needs no non-approved
-    /// key generation (the `rustcrypto` tests use rcgen + Ed25519 instead).
+    /// A self-signed P-256 CA, built with OpenSSL so this backend's tests need no extra dependency
+    /// (the `rustcrypto` tests use rcgen + Ed25519 instead).
     fn ca() -> (X509, PKey<Private>) {
-        crate::test_init();
         let key = p256_key();
         let mut b = X509::builder().unwrap();
         b.set_version(2).unwrap();
