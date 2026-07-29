@@ -195,7 +195,10 @@ mod tests {
         // MlsTlsHandshake envelope: u16 version(0x0000) || u16 payload_tag ClientHello(0x0000).
         let mut out = vec![0x00, 0x00, 0x00, 0x00];
         out.extend_from_slice(&mls_message);
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/interop/rust_clienthello.bin");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../interop/rust_clienthello.bin"
+        );
         std::fs::write(path, &out).unwrap();
         eprintln!("wrote {} bytes to {path}", out.len());
     }

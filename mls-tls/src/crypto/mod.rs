@@ -23,3 +23,14 @@ use mls_rs::CipherSuite;
 /// default under the `rustcrypto` backend). Under the `openssl` backend it is unsupported and
 /// selecting it yields a runtime error.
 pub const MLS_256_XWING_AES256GCM_SHA512_P384: CipherSuite = CipherSuite::new(0x004e);
+
+/// The cipher suites the compiled backend can actually serve.
+///
+/// Which suites exist depends on the backend — X-Wing is `rustcrypto`-only, and the standard suites
+/// are whatever the backend implements — so a caller that wants to offer a choice should ask rather
+/// than assume. Selecting a suite outside this set fails at config construction with
+/// `Error::Unsupported`.
+pub fn supported_cipher_suites() -> Vec<CipherSuite> {
+    use mls_rs::CryptoProvider;
+    provider::MlsTlsCryptoProvider::new().supported_cipher_suites()
+}

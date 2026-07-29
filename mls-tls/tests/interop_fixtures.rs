@@ -13,7 +13,7 @@ use mls_rs::MlsMessage;
 fn parses_python_clienthello() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/interop/python_clienthello.bin"
+        "/../interop/python_clienthello.bin"
     );
     let bytes = match std::fs::read(path) {
         Ok(b) => b,

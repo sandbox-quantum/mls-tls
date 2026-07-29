@@ -211,6 +211,24 @@ pub fn generate_signature_key(
         .map_err(|_| Error::Unsupported("signature key generation failed"))
 }
 
+/// Recover the public half of an existing signature key, for `cipher_suite`'s signature scheme.
+///
+/// The counterpart to [`generate_signature_key`], for the case where only the private key was kept
+/// (loaded from a file, say) and a [`SigningIdentity`] needs the public one too. Returns
+/// `Error::Unsupported` if the backend does not serve the suite, or if `secret` is not a valid key
+/// for it — the key encoding is scheme-specific (a raw P-384 scalar, Ed25519 keypair bytes, …), so
+/// passing one suite's key to another fails here rather than at the first signature.
+pub fn derive_signature_public_key(
+    cipher_suite: CipherSuite,
+    secret: &SignatureSecretKey,
+) -> Result<SignaturePublicKey, Error> {
+    let csp = MlsTlsCryptoProvider::new()
+        .cipher_suite_provider(cipher_suite)
+        .ok_or(Error::Unsupported("cipher suite unavailable"))?;
+    csp.signature_key_derive_public(secret)
+        .map_err(|_| Error::Unsupported("signature key is not valid for this cipher suite"))
+}
+
 /// A single MLS-TLS client connection (the initiator). Deref's to [`ConnectionCommon`].
 pub struct ClientConnection {
     inner: ConnectionCommon,

@@ -716,5 +716,4 @@ mod tests {
         expected[NONCE_LEN - 1] = 1;
         assert_eq!(make_nonce(&iv, 1), expected);
     }
-
 }

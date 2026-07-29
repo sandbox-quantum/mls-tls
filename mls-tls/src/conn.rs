@@ -42,6 +42,24 @@ use crate::resumption::ResumptionState;
 use crate::server::ClientCertVerifier;
 use crate::tls_record::{ContentType, DirectionalRekey, RecordLayer, Role as Side, TlsPlaintext};
 
+// RFC 8446 §6 AlertLevel / AlertDescription. Only the clean-shutdown pair is ever sent: the
+// protocol has no negotiation left to fail once the record layer exists, so every other error is
+// fatal locally rather than something to describe to the peer.
+const ALERT_LEVEL_WARNING: u8 = 1;
+const ALERT_CLOSE_NOTIFY: u8 = 0;
+
+/// The credential a peer presented, as reported by [`ConnectionCommon::peer_identity`].
+///
+/// Mirrors the credential types the two-party profile admits: peer auth is asymmetric, so a Basic
+/// client may legitimately be talking to an X.509 server (see [`crate::pki`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerIdentity {
+    /// A Basic credential's opaque identifier.
+    Basic(Vec<u8>),
+    /// An X.509 chain, leaf first, DER-encoded.
+    X509(Vec<Vec<u8>>),
+}
+
 /// Summary of the connection's I/O state after [`ConnectionCommon::process_new_packets`].
 #[derive(Debug, Clone, Copy)]
 pub struct IoState {
@@ -224,6 +242,17 @@ impl ConnectionCommon {
         Writer { conn: self }
     }
 
+    /// Encrypt and queue `data`, returning the number of plaintext bytes accepted.
+    ///
+    /// The same operation as [`writer`](Self::writer), but reporting the crate's own [`Error`]
+    /// rather than flattening it into an `io::Error` to satisfy the `Write` trait. Use this when
+    /// the failure needs to stay distinguishable — writing before the record layer exists is an
+    /// `UnexpectedMessage`, not an I/O fault, and the `Write` impl cannot say so.
+    pub fn write_plaintext(&mut self, data: &[u8]) -> Result<usize, Error> {
+        self.encrypt_app_data(data)?;
+        Ok(data.len())
+    }
+
     /// True if the caller should read more TLS bytes.
     pub fn wants_read(&self) -> bool {
         !self.peer_closed && self.received_plaintext.is_empty()
@@ -249,6 +278,45 @@ impl ConnectionCommon {
         Ok(ResumptionState {
             group_id: group.group_id().to_vec(),
         })
+    }
+
+    // --- peer / epoch introspection ---
+
+    /// The credential the *peer* presented, or `None` before the group exists.
+    ///
+    /// This reports what the peer sent; it does not re-run verification. The directional check
+    /// against the configured policy already happened during the handshake (see
+    /// [`verify_server`] and [`crate::pki`]), so a credential surfacing here has passed it.
+    pub fn peer_identity(&self) -> Option<PeerIdentity> {
+        // The responder is member 0 and the initiator member 1, fixed by the two-party profile —
+        // the same indexing `verify_server` relies on.
+        let peer_index = match self.side {
+            Side::Client => 0,
+            Side::Server => 1,
+        };
+        let member = self.group.as_ref()?.member_at_index(peer_index)?;
+        match &member.signing_identity().credential {
+            mls_rs::identity::Credential::Basic(basic) => {
+                Some(PeerIdentity::Basic(basic.identifier.to_vec()))
+            }
+            mls_rs::identity::Credential::X509(chain) => Some(PeerIdentity::X509(
+                chain.iter().map(|cert| cert.to_vec()).collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// The negotiated cipher suite, or `None` before the group exists.
+    pub fn cipher_suite(&self) -> Option<CipherSuite> {
+        self.group.as_ref().map(|group| group.cipher_suite())
+    }
+
+    /// The current MLS epoch, or `None` before the group exists.
+    ///
+    /// It advances on every rekey and resumption, so it doubles as a "how many times have these
+    /// keys rotated" counter.
+    pub fn epoch(&self) -> Option<u64> {
+        self.group.as_ref().map(|group| group.current_epoch())
     }
 
     // --- handshake / control dispatch ---
@@ -390,6 +458,20 @@ impl ConnectionCommon {
 
     // --- explicit control ---
 
+    /// Signal a clean shutdown of the write side by sending an encrypted `close_notify` alert.
+    ///
+    /// The alert is an RFC 8446 §6.1 `warning`/`close_notify` body carried as an inner record with
+    /// content type `Alert`, so it rides the same AEAD channel as application data — the receiving
+    /// peer picks it up in [`process_new_packets`](Self::process_new_packets) and reports it as
+    /// `IoState::peer_has_closed`.
+    ///
+    /// Drain the queued bytes with [`write_tls`](Self::write_tls) afterwards; nothing is sent until
+    /// you do. Callers should not require the peer to reply in kind — a bare transport close is a
+    /// legal (if truncation-prone) way for it to go away.
+    pub fn send_close_notify(&mut self) -> Result<(), Error> {
+        self.encrypt_alert(&[ALERT_LEVEL_WARNING, ALERT_CLOSE_NOTIFY])
+    }
+
     /// Explicitly initiate a rekey by sending a `ConnectionUpdate`. Inbound handling of the resulting control is automatic.
     pub fn refresh_traffic_keys(&mut self) -> Result<(), Error> {
         let crypto = MlsTlsCryptoProvider::new();
@@ -491,11 +573,19 @@ impl ConnectionCommon {
     }
 
     fn encrypt_app_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.encrypt(ContentType::ApplicationData, data)
+    }
+
+    fn encrypt_alert(&mut self, body: &[u8]) -> Result<(), Error> {
+        self.encrypt(ContentType::Alert, body)
+    }
+
+    fn encrypt(&mut self, content_type: ContentType, data: &[u8]) -> Result<(), Error> {
         let record = self
             .record
             .as_mut()
             .ok_or(Error::UnexpectedMessage("cannot send before handshake"))?;
-        for inner in record.encrypt(ContentType::ApplicationData, data)? {
+        for inner in record.encrypt(content_type, data)? {
             self.sendable_tls.extend(frame_transport(&inner));
         }
         Ok(())
@@ -552,10 +642,11 @@ pub struct Writer<'a> {
 
 impl Write for Writer<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // The trait forces an `io::Error`, which loses the variant; `write_plaintext` is the
+        // typed alternative for callers that need it.
         self.conn
-            .encrypt_app_data(buf)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(buf.len())
+            .write_plaintext(buf)
+            .map_err(|e| io::Error::other(e.to_string()))
     }
 
     fn flush(&mut self) -> io::Result<()> {

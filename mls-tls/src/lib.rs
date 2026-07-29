@@ -51,10 +51,10 @@ mod stream;
 pub use builder::ConfigBuilder;
 pub use client::{
     ClientConfig, ClientConnection, DEFAULT_CIPHER_SUITE, ServerCertVerifier,
-    generate_signature_key,
+    derive_signature_public_key, generate_signature_key,
 };
-pub use conn::{Connection, ConnectionCommon, IoState, Reader, Writer};
-pub use crypto::MLS_256_XWING_AES256GCM_SHA512_P384;
+pub use conn::{Connection, ConnectionCommon, IoState, PeerIdentity, Reader, Writer};
+pub use crypto::{MLS_256_XWING_AES256GCM_SHA512_P384, supported_cipher_suites};
 pub use error::Error;
 pub use resumption::{ResumptionState, SessionStore};
 pub use server::{ClientCertVerifier, ServerConfig, ServerConnection};
@@ -68,6 +68,17 @@ pub use mls_rs::identity::basic::BasicCredential;
 pub use mls_rs::identity::x509::CertificateChain;
 pub use rustls_pki_types::{CertificateDer, ServerName};
 pub use tls_record::Role as Side;
+
+// A connection must be movable between threads: the blocking adapters are routinely used from a
+// per-connection thread, and the Python bindings rely on it to release the GIL around the
+// CPU-bound handshake work. Assert it here so a future non-`Send` field is caught at compile time
+// rather than at the call site that needed it.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<ConnectionCommon>();
+    assert_send::<ClientConnection>();
+    assert_send::<ServerConnection>();
+};
 
 // --- internal imports for the crate-root handshake helpers ---
 use mls_rs::{
@@ -207,6 +218,75 @@ mod tests {
         let n = to.reader().read(&mut buf).unwrap();
         buf.truncate(n);
         buf
+    }
+
+    /// Each side reports the *other* side's credential — the responder sits at member index 0 and
+    /// the initiator at 1, so getting the indexing backwards would silently report your own.
+    #[test]
+    fn loopback_peer_identity_is_the_other_side() {
+        let (client, server) = established_pair();
+        assert_eq!(
+            client.peer_identity(),
+            Some(crate::PeerIdentity::Basic(b"server".to_vec()))
+        );
+        assert_eq!(
+            server.peer_identity(),
+            Some(crate::PeerIdentity::Basic(b"client".to_vec()))
+        );
+
+        // Both agree on the suite, and epoch 1 is where the initial key agreement lands.
+        assert_eq!(client.cipher_suite(), server.cipher_suite());
+        assert_eq!(client.epoch(), Some(1));
+        assert_eq!(server.epoch(), Some(1));
+    }
+
+    /// A fresh connection has no group yet, so the introspection accessors report nothing rather
+    /// than panicking.
+    #[test]
+    fn introspection_before_handshake_is_none() {
+        let config = ClientConfig::builder()
+            .with_no_certificate_verification()
+            .with_generated_basic_credential(b"client")
+            .unwrap();
+        let client =
+            ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
+        assert!(client.peer_identity().is_none());
+        assert!(client.cipher_suite().is_none());
+        assert!(client.epoch().is_none());
+    }
+
+    /// `close_notify` rides the AEAD channel and surfaces as `peer_has_closed`, without disturbing
+    /// application data already in flight ahead of it.
+    #[test]
+    fn loopback_close_notify() {
+        let (mut client, mut server) = established_pair();
+
+        client.writer().write_all(b"last words").unwrap();
+        client.send_close_notify().unwrap();
+        pump(&mut client, &mut server);
+
+        let state = server.process_new_packets().unwrap();
+        assert!(state.peer_has_closed, "server should see the close_notify");
+
+        // The data queued before the alert is still readable.
+        let mut buf = [0u8; 32];
+        let n = server.reader().read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"last words");
+    }
+
+    /// Sending `close_notify` before the record layer exists is an error, not a panic.
+    #[test]
+    fn close_notify_before_handshake_errors() {
+        let config = ClientConfig::builder()
+            .with_no_certificate_verification()
+            .with_generated_basic_credential(b"client")
+            .unwrap();
+        let mut client =
+            ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
+        assert!(matches!(
+            client.send_close_notify().unwrap_err(),
+            crate::error::Error::UnexpectedMessage(_)
+        ));
     }
 
     #[test]

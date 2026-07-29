@@ -273,7 +273,7 @@ mod tests {
     use super::*;
 
     fn vectors() -> serde_json::Value {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/interop/kat_vectors.json");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../interop/kat_vectors.json");
         let raw = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {path}: {e} (run interop/dump_kat.py first)"));
         serde_json::from_str(&raw).expect("parse kat_vectors.json")

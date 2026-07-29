@@ -11,7 +11,7 @@ use ml_kem::ml_kem_1024::Ciphertext;
 use ml_kem::{B32, Decapsulate, DecapsulationKey1024, EncapsulationKey1024, KeyExport, Seed};
 
 fn load_vectors() -> serde_json::Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/interop/kat_vectors.json");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../interop/kat_vectors.json");
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("read {path}: {e} (run interop/dump_kat.py first)"));
     serde_json::from_str(&raw).expect("parse kat_vectors.json")
