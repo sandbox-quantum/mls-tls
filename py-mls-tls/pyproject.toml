@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "mls-tls"
+description = "MLS-TLS: an MLS group as the key-agreement engine for a TLS 1.3 record layer"
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Security :: Cryptography",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+# Mixed layout: the compiled core is a private submodule and `python/mls_tls/` supplies the public
+# API on top of it (the pyca/cryptography split). `extension-module` lives here rather than in
+# Cargo.toml so `cargo build`/`cargo test` at the workspace root still work.
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "mls_tls._mls_tls"
+
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.14,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

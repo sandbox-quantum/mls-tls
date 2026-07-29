@@ -1,0 +1,27 @@
+[package]
+name = "py-mls-tls"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+# The Python package is `mls_tls`; this is its private extension module (see pyproject.toml's
+# `module-name`). Naming it with a leading underscore keeps the split visible from Python.
+name = "_mls_tls"
+crate-type = ["cdylib"]
+
+[features]
+# Mirrors the core crate's mutually-exclusive backend choice; a wheel is built for one of them.
+# `pyo3/extension-module` is deliberately NOT listed here — maturin adds it — so that a plain
+# `cargo build`/`cargo test` at the workspace root still links against libpython and works.
+default = ["rustcrypto"]
+rustcrypto = ["mls-tls/rustcrypto"]
+openssl = ["mls-tls/openssl"]
+
+[dependencies]
+mls-tls = { path = "../mls-tls", default-features = false }
+# abi3 gives one wheel per platform instead of one per interpreter. The floor is 3.11 rather than
+# something older because `pyo3::buffer::PyBuffer` — how `read_into`/`write_tls_into` fill a
+# caller's `bytearray`/`memoryview` without an extra allocation — is not in the limited API before
+# then. 3.10 is the last release that would have been excluded and it is already at end of life.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }

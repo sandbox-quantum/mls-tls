@@ -4,3 +4,9 @@ Cargo.lock
 # KAT vectors (interop/kat_vectors.json) are intentionally NOT ignored so they can be committed.
 /interop/.venv
 /interop/*.bin
+
+# Python bindings: the dev venv and the artefacts maturin/pytest drop in-tree.
+/py-mls-tls/.venv
+__pycache__/
+.pytest_cache/
+*.so
