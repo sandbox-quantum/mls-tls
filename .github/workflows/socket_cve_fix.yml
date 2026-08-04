@@ -13,6 +13,12 @@ permissions:
   issues: write
 jobs:
   socket-fix:
+    # workflow_dispatch can be triggered from ANY branch, and this job materializes the
+    # org-wide App private key on the runner — so a throwaway branch would otherwise be
+    # enough to release it. Constrain ONLY the manual path; the `schedule` triggers are
+    # left completely alone (they can only ever run on the default branch anyway), so
+    # this cannot silently stop the crons.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
@@ -27,7 +33,11 @@ jobs:
           node-version: '20'
 
       - name: Install npm socket CLI
-        run: npm i -g socket
+        # Pinned on purpose: this step executes BEFORE the App-private-key step in the
+        # SAME job, so an unpinned `socket` release is arbitrary code execution running
+        # alongside the org's highest-value credential. Bump deliberately — a global
+        # `npm i -g` is not covered by renovate.json5's npm rules.
+        run: npm i -g socket@1.1.152
 
       - name: Generate CycloneDX SBOM (non-native ecosystems)
         # npm/yarn/pnpm + pip are parsed natively by `socket fix`;
