@@ -47,12 +47,23 @@ jobs:
         # alongside the org's highest-value credential. Bump deliberately — a global
         # `npm i -g` is not covered by renovate.json5's npm rules.
         #
-        # Held at 1.1.147, NOT `latest`. socket@1.1.152 (published 2026-08-03, currently
-        # the `latest` tag) ships a broken bundle: `dist/vendor.js` requires 'form-data'
-        # but the package declares only @socketsecurity/socket-patch, so every `socket
-        # fix` run dies with "Cannot find module 'form-data'". 1.1.147 is the last release
-        # observed green in this workflow (run 30681967984, 2026-08-01). Re-test before
-        # moving this forward.
+        # Held at 1.1.147, NOT `latest`. Upstream regression introduced in 1.1.151 and
+        # still present in 1.1.152 (the current `latest`): dist/vendor.js was rewritten to
+        # call requireHere("form-data") on the scan-upload path, but form-data is not a
+        # declared dependency and is not vendored into the tarball, so it cannot resolve.
+        # vendor.js is byte-identical between 1.1.151 and 1.1.152, so rolling back a
+        # single version does not help. The manifest is unchanged from 1.1.147 — only the
+        # bundle differs.
+        #
+        # Symptom: install and auth both succeed, then the run dies mid-operation with
+        # "Socket API error: Unexpected Socket API error: Cannot find module 'form-data'"
+        # (the SDK wraps MODULE_NOT_FOUND as an API error). `socket --version` still
+        # exits 0, so a smoke test does not catch this.
+        #
+        # 1.1.147 is the last release that needs no form-data, and the last observed green
+        # here (run 30681967984, 2026-08-01). No fixed release exists above 1.1.152. Do
+        # NOT "fix" this by jumping to socket@2 — 2.x is an abandoned Oct/Nov-2025 line
+        # that merely sorts higher by semver. Re-test before moving this forward.
         run: npm i -g socket@1.1.147
 
       - name: Generate CycloneDX SBOM (non-native ecosystems)
