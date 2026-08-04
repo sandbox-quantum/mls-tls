@@ -50,6 +50,17 @@ jobs:
           client-id: ${{ secrets.AUTOFIX_PR_BOT_CLIENT_ID }}
           private-key: ${{ secrets.AUTOFIX_PR_BOT_APP_PRIVATE_KEY }}
 
+      - name: Announce degraded mode (no PR-bot App token)
+        # The fallback below is deliberate, but it must not be silent: PRs opened
+        # with GITHUB_TOKEN trigger neither CircleCI nor renovate_jira.yml, so the
+        # run looks green while two downstream guarantees are quietly absent.
+        # Started when this repo became public on 2026-08-03 -- VULNMGMT-1076.
+        if: ${{ env.BOT_CLIENT_ID == '' }}
+        run: |
+          msg='AUTOFIX_PR_BOT_CLIENT_ID does not resolve in this repository, so Renovate is running on GITHUB_TOKEN. PRs opened by this run will NOT trigger CircleCI and will NOT be ticketed by renovate_jira.yml. See VULNMGMT-1076.'
+          echo "::warning title=Renovate degraded::${msg}"
+          { echo '### Renovate is running in degraded mode'; echo; echo "${msg}"; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Resolve dry-run flag
         id: cfg
         shell: bash -eo pipefail {0}
