@@ -13,7 +13,22 @@ permissions:
   issues: write
 jobs:
   socket-fix:
+    # workflow_dispatch can be triggered from ANY branch, and this job materializes the
+    # org-wide App private key on the runner — so a throwaway branch would otherwise be
+    # enough to release it. Constrain ONLY the manual path; the `schedule` triggers are
+    # left completely alone (they can only ever run on the default branch anyway), so
+    # this cannot silently stop the crons.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      # Gate the App-token step without referencing a missing secret in an `if:`
+      # (same pattern renovate.yml already uses in this repo). This repo became
+      # public on 2026-08-03; org secrets with `visibility: private` stopped
+      # resolving here at that moment, and create-github-app-token hard-errors on
+      # an empty client-id -- which would take the whole CVE autofix down with it.
+      # SOCKET_KEY is unaffected (org visibility `all`), so the fix run itself is
+      # still fully functional on GITHUB_TOKEN. Tracked in VULNMGMT-1076.
+      BOT_CLIENT_ID: ${{ secrets.AUTOFIX_PR_BOT_CLIENT_ID }}
 
     steps:
       - name: Checkout repo
@@ -27,7 +42,11 @@ jobs:
           node-version: '20'
 
       - name: Install npm socket CLI
-        run: npm i -g socket
+        # Pinned on purpose: this step executes BEFORE the App-private-key step in the
+        # SAME job, so an unpinned `socket` release is arbitrary code execution running
+        # alongside the org's highest-value credential. Bump deliberately — a global
+        # `npm i -g` is not covered by renovate.json5's npm rules.
+        run: npm i -g socket@1.1.152
 
       - name: Generate CycloneDX SBOM (non-native ecosystems)
         # npm/yarn/pnpm + pip are parsed natively by `socket fix`;
@@ -37,31 +56,42 @@ jobs:
 
       - name: Generate github App Token #Generate short-lived Installation Access Token
         id: generate-token
+        if: ${{ env.BOT_CLIENT_ID != '' }}
         uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
         with:
           client-id: ${{ secrets.AUTOFIX_PR_BOT_CLIENT_ID }}
           private-key: ${{ secrets.AUTOFIX_PR_BOT_APP_PRIVATE_KEY }}
 
+      - name: Announce degraded mode (no PR-bot App token)
+        # Falling back is better than failing -- but it must never be silent. A PR
+        # opened with GITHUB_TOKEN does not trigger other workflows, so these fixes
+        # land without CircleCI validation and without VULNMGMT ticketing.
+        if: ${{ env.BOT_CLIENT_ID == '' }}
+        run: |
+          msg='AUTOFIX_PR_BOT_CLIENT_ID does not resolve in this repository, so Socket Fix is running on GITHUB_TOKEN. Fixes are still applied and PRs still opened, but those PRs will NOT trigger CircleCI or VULNMGMT ticketing. See VULNMGMT-1076.'
+          echo "::warning title=Socket Fix degraded::${msg}"
+          { echo '### Socket Fix is running in degraded mode'; echo; echo "${msg}"; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run Socket Fix CLI monthly for major fixes
         env:
-            SOCKET_CLI_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+            SOCKET_CLI_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
             SOCKET_CLI_GIT_USER_EMAIL: socket-fix[bot]@users.noreply.github.com
             SOCKET_CLI_GIT_USER_NAME: socket-fix[bot]
             SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_KEY }}
             SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_KEY }}
-            GH_API_TOKEN: ${{ steps.generate-token.outputs.token }}
+            GH_API_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
             CI: true
         if: github.event.schedule == '15 2 1 * *' || github.event_name == 'workflow_dispatch'
         run: socket fix --minimum-release-age 2w --all
 
       - name: Run Socket Fix CLI weekly for minor fixes
         env:
-            SOCKET_CLI_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
+            SOCKET_CLI_GITHUB_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
             SOCKET_CLI_GIT_USER_EMAIL: socket-fix[bot]@users.noreply.github.com
             SOCKET_CLI_GIT_USER_NAME: socket-fix[bot]
             SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_KEY }}
             SOCKET_SECURITY_API_KEY: ${{ secrets.SOCKET_KEY }}
-            GH_API_TOKEN: ${{ steps.generate-token.outputs.token }}
+            GH_API_TOKEN: ${{ steps.generate-token.outputs.token || github.token }}
             CI: true
         if: github.event.schedule == '15 12 * * 0'
         run: socket fix --minimum-release-age 3d --all --no-major-updates
