@@ -72,3 +72,7 @@ rcgen = "0.14"
 ed25519-dalek = "2"
 hex = "0.4.3"
 serde_json = "1"
+# Used only by the ttfb bench's OpenSSL baseline (openssl_stack.rs) to reach the raw `*mut SSL` for the
+# hand-bound `SSL_key_update` (KeyUpdate is not exposed by the `openssl` crate). Version matches the one
+# `openssl` 0.10 itself depends on, so the `ForeignTypeRef::as_ptr` impl lines up.
+foreign-types = "0.3.1"
