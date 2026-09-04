@@ -49,6 +49,12 @@ use mls_tls::{
 #[path = "netsim.rs"]
 mod netsim;
 
+// The OpenSSL TLS 1.3 baseline the mls-tls scenarios are compared against. Only available when the
+// crate is built with the OpenSSL crypto backend, since it needs the `openssl` crate.
+#[cfg(feature = "openssl")]
+#[path = "openssl_stack.rs"]
+mod openssl_stack;
+
 use netsim::{BenchError, LatencyProxy};
 
 /// Payloads are deliberately small: this measures round trips, not bandwidth.
@@ -101,11 +107,17 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    /// Start a server for `config` reachable through a relay delaying each direction by `one_way`.
-    fn start(config: Arc<ServerConfig>, one_way: Duration) -> Result<Self, BenchError> {
+    /// Start a server driven by `serve_fn` reachable through a relay delaying each direction by
+    /// `one_way`. `serve_fn` owns the accepted-connection loop (see [`serve`] for the mls-tls one and
+    /// `openssl_stack::openssl_serve` for the OpenSSL baseline), so the same relay/timing plumbing
+    /// fronts either stack.
+    fn start(
+        one_way: Duration,
+        serve_fn: impl FnOnce(TcpListener) -> io::Result<()> + Send + 'static,
+    ) -> Result<Self, BenchError> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let upstream = listener.local_addr()?;
-        let server = thread::spawn(move || serve(listener, config));
+        let server = thread::spawn(move || serve_fn(listener));
         let relay = LatencyProxy::start(upstream, one_way)?;
         Ok(Self {
             addr: relay.addr(),
@@ -165,17 +177,72 @@ fn serve(listener: TcpListener, config: Arc<ServerConfig>) -> io::Result<()> {
 
 type ScenarioFn = fn(CipherSuite, Duration) -> Result<Duration, BenchError>;
 
-const SCENARIOS: &[(&str, ScenarioFn)] = &[
+/// A protocol stack under test, and the scenarios it can run. Both stacks are driven through the same
+/// relay and timing plumbing, so their rows are directly comparable.
+struct Stack {
+    name: &'static str,
+    scenarios: &'static [(&'static str, ScenarioFn)],
+    /// Whether this stack can serve `cipher_suite` in this build.
+    supports: fn(CipherSuite) -> bool,
+}
+
+/// mls-tls scenarios (see the module docs for flight counts).
+const MLS_SCENARIOS: &[(&str, ScenarioFn)] = &[
     ("handshake", bench_handshake),
     ("key-update", bench_key_update),
     ("resumption", bench_resumption),
 ];
 
+/// OpenSSL TLS 1.3 baseline scenarios. Resumption is split into 0-RTT (early data, two flights) and
+/// 1-RTT (replay-safe, four flights) so both sides of that trade-off are visible next to mls-tls's
+/// single two-flight resumption.
+#[cfg(feature = "openssl")]
+const OPENSSL_SCENARIOS: &[(&str, ScenarioFn)] = &[
+    ("handshake", openssl_stack::bench_handshake_openssl),
+    ("key-update", openssl_stack::bench_key_update_openssl),
+    ("resumption-0rtt", openssl_stack::bench_resumption_0rtt_openssl),
+    ("resumption-1rtt", openssl_stack::bench_resumption_1rtt_openssl),
+];
+
+/// Stack names selectable with `--stacks`. `openssl` is only *available* under `--features openssl`
+/// (see [`available_stacks`]); it is listed here so `--stacks openssl` on a rustcrypto build fails
+/// with a clear message rather than "unknown value".
+const ALL_STACK_NAMES: &[&str] = &["mls-tls", "openssl"];
+
+/// Every scenario label across all stacks, in display order — used to validate `--scenarios` and to
+/// group the output so the same scenario sits together across stacks.
+const ALL_SCENARIOS: &[&str] = &[
+    "handshake",
+    "key-update",
+    "resumption",
+    "resumption-0rtt",
+    "resumption-1rtt",
+];
+
+/// The stacks this build can actually run: mls-tls always, plus the OpenSSL baseline under
+/// `--features openssl`.
+fn available_stacks() -> Vec<Stack> {
+    // `mut` is only needed when the openssl push below is compiled in.
+    #[cfg_attr(not(feature = "openssl"), allow(unused_mut))]
+    let mut stacks = vec![Stack {
+        name: "mls-tls",
+        scenarios: MLS_SCENARIOS,
+        supports: |cs| configs(cs).is_ok(),
+    }];
+    #[cfg(feature = "openssl")]
+    stacks.push(Stack {
+        name: "openssl",
+        scenarios: OPENSSL_SCENARIOS,
+        supports: |cs| openssl_stack::suite_to_openssl(cs).is_some(),
+    });
+    stacks
+}
+
 /// Fresh connection: `ClientConnection::new` (which generates the KeyPackage and queues the
 /// ClientHello) through to the first response byte. Four flights.
 fn bench_handshake(cipher_suite: CipherSuite, one_way: Duration) -> Result<Duration, BenchError> {
     let peers = configs(cipher_suite)?;
-    let endpoint = Endpoint::start(peers.server, one_way)?;
+    let endpoint = Endpoint::start(one_way, move |l| serve(l, peers.server))?;
     let sock = connect(endpoint.addr())?;
 
     let start = Instant::now();
@@ -206,7 +273,7 @@ fn bench_key_update(cipher_suite: CipherSuite, one_way: Duration) -> Result<Dura
     // different endpoint the way resumption's can. Instead the relay starts fast and is slowed down
     // once the connection has settled, which keeps the untimed setup off the clock entirely — at
     // rtt=3s that is the difference between 9 s and 3 s per iteration.
-    let endpoint = Endpoint::start(peers.server, Duration::ZERO)?;
+    let endpoint = Endpoint::start(Duration::ZERO, move |l| serve(l, peers.server))?;
     let sock = connect(endpoint.addr())?;
     let conn = ClientConnection::new(peers.client, server_name())?;
     let mut tls = StreamOwned::new(conn, sock);
@@ -246,7 +313,8 @@ fn bench_resumption(cipher_suite: CipherSuite, one_way: Duration) -> Result<Dura
 
     // Untimed: establish, exchange once, and persist the group.
     let resumption = {
-        let endpoint = Endpoint::start(peers.server.clone(), Duration::ZERO)?;
+        let server = peers.server.clone();
+        let endpoint = Endpoint::start(Duration::ZERO, move |l| serve(l, server))?;
         let sock = connect(endpoint.addr())?;
         let conn = ClientConnection::new(peers.client.clone(), server_name())?;
         let mut tls = StreamOwned::new(conn, sock);
@@ -263,7 +331,7 @@ fn bench_resumption(cipher_suite: CipherSuite, one_way: Duration) -> Result<Dura
 
     // The configs are shared with the setup connection, so both sides can reload the group from
     // their (Arc-backed) session stores.
-    let endpoint = Endpoint::start(peers.server, one_way)?;
+    let endpoint = Endpoint::start(one_way, move |l| serve(l, peers.server))?;
     let mut sock = connect(endpoint.addr())?;
 
     let start = Instant::now();
@@ -342,8 +410,9 @@ fn suite_label(cipher_suite: CipherSuite) -> String {
 // Statistics and reporting
 // ---------------------------------------------------------------------------
 
-/// One (suite, scenario, rtt) cell: the sorted sample set plus what it took to produce.
+/// One (stack, suite, scenario, rtt) cell: the sorted sample set plus what it took to produce.
 struct Row {
+    stack: &'static str,
     suite: String,
     scenario: &'static str,
     rtt_ms: f64,
@@ -383,16 +452,16 @@ fn flights(row: &Row, rows: &[Row]) -> Option<f64> {
     if row.rtt_ms == 0.0 {
         return None;
     }
-    let baseline = rows
-        .iter()
-        .find(|r| r.suite == row.suite && r.scenario == row.scenario && r.rtt_ms == 0.0)?;
+    let baseline = rows.iter().find(|r| {
+        r.stack == row.stack && r.suite == row.suite && r.scenario == row.scenario && r.rtt_ms == 0.0
+    })?;
     Some((row.min() - baseline.min()) / (row.rtt_ms / 2.0))
 }
 
 fn report_text(rows: &[Row], args: &Args) {
     println!("mls-tls TTFB benchmark");
     println!(
-        "backend: {}   request: {} B   response: {} B",
+        "mls-tls crypto backend: {}   request: {} B   response: {} B",
         backend_name(),
         REQUEST.len(),
         RESPONSE.len(),
@@ -408,8 +477,8 @@ fn report_text(rows: &[Row], args: &Args) {
     println!("excluded from t0..t1: TCP setup, config build, per-scenario setup phases");
     println!();
     println!(
-        "{:<8} {:<11} {:>7} {:>3} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "suite", "scenario", "rtt", "n", "min", "p50", "p90", "max", "flights",
+        "{:<8} {:<8} {:<15} {:>7} {:>3} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "stack", "suite", "scenario", "rtt", "n", "min", "p50", "p90", "max", "flights",
     );
     for row in rows {
         let flights = match flights(row, rows) {
@@ -417,7 +486,8 @@ fn report_text(rows: &[Row], args: &Args) {
             None => "—".to_string(),
         };
         println!(
-            "{:<8} {:<11} {:>7} {:>3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9}",
+            "{:<8} {:<8} {:<15} {:>7} {:>3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9}",
+            row.stack,
             row.suite,
             row.scenario,
             format_rtt(row.rtt_ms),
@@ -450,6 +520,7 @@ fn report_json(rows: &[Row], args: &Args) {
         .iter()
         .map(|row| {
             serde_json::json!({
+                "stack": row.stack,
                 "suite": row.suite,
                 "scenario": row.scenario,
                 "rtt_ms": row.rtt_ms,
@@ -503,10 +574,15 @@ mls-tls time-to-first-byte benchmark
     --budget-ms <n>      wall-clock target per cell (default 5000). Cells cheaper
                          than this run the full --iterations; slow ones run fewer,
                          down to --min-iterations. The `n` column reports which.
-    --warmup <n>         discarded iterations, once per suite+scenario (default 2)
-    --scenarios <list>   handshake, key-update, resumption (default: all)
+    --warmup <n>         discarded iterations, once per stack+suite+scenario (default 2)
+    --stacks <list>      mls-tls, openssl (default: all available; openssl needs
+                         --features openssl). The openssl stack is the OpenSSL
+                         TLS 1.3 baseline mls-tls is compared against.
+    --scenarios <list>   handshake, key-update, resumption (mls-tls),
+                         resumption-0rtt, resumption-1rtt (openssl) (default: all)
     --suites <list>      default, xwing, p256, p384, p521, x25519, x448
-                         (default: default,p384; duplicates collapse)
+                         (default: default,p384; duplicates collapse). Suites a
+                         stack cannot serve are skipped for that stack.
     --json               machine-readable output
     --help               this text";
 
@@ -516,7 +592,10 @@ struct Args {
     min_iterations: usize,
     budget: Duration,
     warmup: usize,
-    scenarios: Vec<(&'static str, ScenarioFn)>,
+    /// Scenario labels to run; empty means all. Filtered per stack (a stack skips labels it lacks).
+    scenarios: Vec<String>,
+    /// Stack names to run; empty means all available.
+    stacks: Vec<String>,
     suites: Vec<CipherSuite>,
     json: bool,
 }
@@ -534,7 +613,8 @@ impl Default for Args {
             min_iterations: 3,
             budget: Duration::from_secs(5),
             warmup: 2,
-            scenarios: SCENARIOS.to_vec(),
+            scenarios: Vec::new(),
+            stacks: Vec::new(),
             suites: vec![DEFAULT_CIPHER_SUITE, CipherSuite::P384_AES256],
             json: false,
         };
@@ -556,6 +636,15 @@ impl Args {
         self.iterations = 1;
         self.min_iterations = 1;
         self.warmup = 0;
+    }
+
+    /// An empty filter means "all".
+    fn wants_scenario(&self, label: &str) -> bool {
+        self.scenarios.is_empty() || self.scenarios.iter().any(|s| s == label)
+    }
+
+    fn wants_stack(&self, name: &str) -> bool {
+        self.stacks.is_empty() || self.stacks.iter().any(|s| s == name)
     }
 }
 
@@ -600,7 +689,12 @@ impl Args {
                 }
                 "--scenarios" => {
                     args.scenarios = parse_list(&value()?, |s| {
-                        SCENARIOS.iter().find(|(name, _)| *name == s).copied()
+                        ALL_SCENARIOS.contains(&s).then(|| s.to_string())
+                    })?;
+                }
+                "--stacks" => {
+                    args.stacks = parse_list(&value()?, |s| {
+                        ALL_STACK_NAMES.contains(&s).then(|| s.to_string())
                     })?;
                 }
                 "--suites" => args.suites = parse_list(&value()?, suite_by_name)?,
@@ -667,11 +761,29 @@ fn run(args: &Args) -> Result<(), BenchError> {
              mean nothing. Measure with `cargo bench --bench ttfb`."
         );
     }
-    // Check every suite up front. X-Wing exists only under `rustcrypto`, so a mismatched
-    // `--suites`/`--features` pair would otherwise die opaquely partway through a sweep.
-    for cipher_suite in &args.suites {
-        configs(*cipher_suite)
-            .map_err(|_| BenchError::UnsupportedSuite(suite_label(*cipher_suite)))?;
+    let stacks = available_stacks();
+    // A requested stack that this build doesn't have (e.g. `openssl` on a rustcrypto build) should
+    // fail loudly, not silently produce no rows.
+    for name in &args.stacks {
+        if !stacks.iter().any(|s| s.name == *name) {
+            return Err(BenchError::UnsupportedStack(name.clone()));
+        }
+    }
+    let selected: Vec<&Stack> = stacks.iter().filter(|s| args.wants_stack(s.name)).collect();
+
+    // Note any (stack, suite) a stack can't serve — X-Wing has no OpenSSL row, and no suite runs on a
+    // stack whose backend lacks it — so a mismatched `--suites`/`--stacks`/`--features` is visible
+    // rather than quietly yielding fewer rows.
+    for stack in &selected {
+        for cipher_suite in &args.suites {
+            if !(stack.supports)(*cipher_suite) {
+                eprintln!(
+                    "note: the {} stack cannot serve suite {}; skipping those cells",
+                    stack.name,
+                    suite_label(*cipher_suite),
+                );
+            }
+        }
     }
 
     let mut rows = Vec::new();
@@ -679,48 +791,71 @@ fn run(args: &Args) -> Result<(), BenchError> {
     // the carriage returns turn into noise once stderr is redirected.
     let progress = io::stderr().is_terminal();
 
+    // Grouped suite → scenario → stack → rtt, so the same (suite, scenario) sits together across
+    // stacks and the comparison reads down the page.
     for cipher_suite in &args.suites {
         let label = suite_label(*cipher_suite);
-        for (scenario, bench) in &args.scenarios {
-            for (index, rtt_ms) in args.rtt_ms.iter().enumerate() {
-                let one_way = Duration::from_secs_f64(rtt_ms / 2000.0);
-                if progress {
-                    eprint!("\r{label:<8} {scenario:<11} rtt={rtt_ms}ms          ");
+        for scenario in ALL_SCENARIOS.iter().copied().filter(|l| args.wants_scenario(l)) {
+            for stack in &selected {
+                if !(stack.supports)(*cipher_suite) {
+                    continue;
                 }
+                let Some(bench) = stack
+                    .scenarios
+                    .iter()
+                    .find(|(l, _)| *l == scenario)
+                    .map(|(_, b)| *b)
+                else {
+                    continue; // this stack does not have this scenario
+                };
 
-                // Warm up once per suite+scenario rather than per cell. What warmup is for here is
-                // process-wide state — allocator growth, page faults, lazily initialised crypto —
-                // none of which is per-RTT, and at the top of the sweep a discarded iteration costs
-                // seconds.
-                if index == 0 {
-                    for _ in 0..args.warmup {
-                        bench(*cipher_suite, one_way)?;
+                for (index, rtt_ms) in args.rtt_ms.iter().enumerate() {
+                    let one_way = Duration::from_secs_f64(rtt_ms / 2000.0);
+                    if progress {
+                        eprint!("\r{:<8} {label:<8} {scenario:<15} rtt={rtt_ms}ms          ", stack.name);
                     }
-                }
 
-                // Take one sample, then let its cost decide how many more to afford. A 3 s RTT
-                // handshake is 6 s an iteration, so a fixed count would put the sweep in the tens of
-                // minutes; the flights are also far more precisely resolved there, so fewer samples
-                // buy just as much confidence.
-                let mut samples = Vec::with_capacity(args.iterations);
-                samples.push(bench(*cipher_suite, one_way)?);
-                let target = affordable_iterations(samples[0], args);
-                while samples.len() < target {
+                    // Warm up once per stack+suite+scenario rather than per cell. What warmup is for
+                    // here is process-wide state — allocator growth, page faults, lazily initialised
+                    // crypto — none of which is per-RTT, and at the top of the sweep a discarded
+                    // iteration costs seconds.
+                    if index == 0 {
+                        for _ in 0..args.warmup {
+                            bench(*cipher_suite, one_way)?;
+                        }
+                    }
+
+                    // Take one sample, then let its cost decide how many more to afford. A 3 s RTT
+                    // handshake is 6 s an iteration, so a fixed count would put the sweep in the tens
+                    // of minutes; the flights are also far more precisely resolved there, so fewer
+                    // samples buy just as much confidence.
+                    let mut samples = Vec::with_capacity(args.iterations);
                     samples.push(bench(*cipher_suite, one_way)?);
-                }
-                samples.sort_unstable();
+                    let target = affordable_iterations(samples[0], args);
+                    while samples.len() < target {
+                        samples.push(bench(*cipher_suite, one_way)?);
+                    }
+                    samples.sort_unstable();
 
-                rows.push(Row {
-                    suite: label.clone(),
-                    scenario,
-                    rtt_ms: *rtt_ms,
-                    samples,
-                });
+                    rows.push(Row {
+                        stack: stack.name,
+                        suite: label.clone(),
+                        scenario,
+                        rtt_ms: *rtt_ms,
+                        samples,
+                    });
+                }
             }
         }
     }
     if progress {
-        eprintln!("\r{:<40}", "");
+        eprintln!("\r{:<60}", "");
+    }
+
+    if rows.is_empty() {
+        return Err(BenchError::Io(io::Error::other(
+            "no (stack, suite, scenario) cells to run — check --stacks/--suites/--scenarios against the build",
+        )));
     }
 
     if args.json {
