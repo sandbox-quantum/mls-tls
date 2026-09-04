@@ -45,8 +45,12 @@ pub enum BenchError {
     Io(#[from] io::Error),
     #[error("peer closed before the scenario reached its first application byte")]
     UnexpectedEof,
+    // Constructed by the openssl-stack baseline; unused under a rustcrypto-only build.
+    #[cfg_attr(not(feature = "openssl"), allow(dead_code))]
     #[error("cipher suite {0} is not available in this build — check --suites against --features")]
     UnsupportedSuite(String),
+    #[error("stack {0:?} is not available in this build — the openssl stack needs --features openssl")]
+    UnsupportedStack(String),
 }
 
 /// Bytes in flight, deliverable at `deliver_at`.
